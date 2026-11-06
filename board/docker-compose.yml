@@ -1,0 +1,23 @@
+# Autodarter board client – runs on the Raspberry Pi with the cameras attached.
+# Start:  cp .env.example .env  (set AUTODARTER_SERVER)  &&  docker compose up -d --build
+# Status page + pairing code: http://<pi-ip>:3180
+
+services:
+  board:
+    build: .
+    image: autodarter/board:latest
+    restart: unless-stopped
+    # host network: reach the server on the LAN and serve the status page on port 3180
+    network_mode: host
+    environment:
+      AUTODARTER_SERVER: ${AUTODARTER_SERVER:-}
+      CAMERA_SOURCE: ${CAMERA_SOURCE:-v4l2}
+      CAMERAS: ${CAMERAS:-}
+      LOCAL_PORT: ${LOCAL_PORT:-3180}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    volumes:
+      - ./data:/data          # board identity, calibration, settings
+      - /dev:/dev             # USB cameras (hot-plug safe)
+      - /run/udev:/run/udev:ro
+    device_cgroup_rules:
+      - "c 81:* rmw"          # video4linux devices

@@ -1,0 +1,38 @@
+{
+  "expo": {
+    "name": "Autodarter",
+    "slug": "autodarter",
+    "scheme": "autodarter",
+    "version": "0.1.0",
+    "orientation": "default",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "dark",
+    "backgroundColor": "#0b0f14",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "app.autodarter"
+    },
+    "android": {
+      "package": "app.autodarter",
+      "adaptiveIcon": {
+        "backgroundColor": "#0b0f14",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false
+    },
+    "web": {
+      "favicon": "./assets/favicon.png",
+      "output": "single",
+      "bundler": "metro",
+      "name": "Autodarter",
+      "themeColor": "#0b0f14",
+      "backgroundColor": "#0b0f14"
+    },
+    "plugins": ["expo-router"],
+    "experiments": {
+      "typedRoutes": false
+    }
+  }
+}

@@ -1,0 +1,9 @@
+**/node_modules
+**/dist
+**/.expo
+**/.git
+**/__pycache__
+**/.pytest_cache
+board/data
+*.log
+.env

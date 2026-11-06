@@ -1,0 +1,39 @@
+# Autodarter – server stack (web app + API + database).
+# Start:  cp .env.example .env  (set JWT_SECRET!)  &&  docker compose up -d --build
+# Then open http://<server-ip>:3000
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: autodarter
+      POSTGRES_USER: autodarter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autodarter}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autodarter -d autodarter"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  server:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: autodarter/server:latest
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://autodarter:${POSTGRES_PASSWORD:-autodarter}@db:5432/autodarter
+      JWT_SECRET: ${JWT_SECRET:?Bitte JWT_SECRET in .env setzen}
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    ports:
+      - "${PORT:-3000}:3000"
+
+volumes:
+  pgdata:

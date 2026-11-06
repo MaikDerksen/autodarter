@@ -1,0 +1,5 @@
+# Keep LF line endings everywhere (Dockerfiles and scripts run on Linux / the Pi)
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.ico binary
