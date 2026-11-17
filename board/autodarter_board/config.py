@@ -15,6 +15,15 @@ CAMERA_SOURCE = os.environ.get("CAMERA_SOURCE", "v4l2").lower()  # v4l2 | sim
 CAMERAS = [c.strip() for c in os.environ.get("CAMERAS", "").split(",") if c.strip()]
 SIM_AUTOCALIBRATE = os.environ.get("SIM_AUTOCALIBRATE", "1") != "0"
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Allow rebooting the Raspberry Pi from the web app (needs the host D-Bus socket mounted)
+ALLOW_REBOOT = os.environ.get("ALLOW_REBOOT", "false").lower() in ("1", "true", "yes")
+DBUS_SOCKET = os.environ.get("DBUS_SOCKET", "/run/dbus/system_bus_socket")
+# Auto-update: the updater container (profile "autoupdate") touches HEARTBEAT regularly and
+# runs an update as soon as UPDATE_REQUEST exists (both inside the shared ./data folder).
+UPDATER_HEARTBEAT = DATA_DIR / ".autoupdate-heartbeat"
+UPDATE_REQUEST = DATA_DIR / "update-request"
+# Version of the image (set by CI), falls back to the package version.
+BUILD_VERSION = os.environ.get("AUTODARTER_VERSION", "")
 
 
 @dataclass

@@ -4,6 +4,7 @@
  */
 import type { Point, Segment } from './board';
 import type { MatchSettings, MatchState, PlayerInfo } from './match';
+import type { MatchVoice } from './voice';
 
 export type BoardState =
   | 'stopped'
@@ -30,6 +31,8 @@ export interface CameraInfo {
 /** Calibration points in normalised image coordinates (0..1), ordered like CALIBRATION_POINTS. */
 export interface CameraCalibration {
   points: Point[];
+  /** Stable id of the camera (USB port) the calibration belongs to. */
+  camId?: string;
 }
 
 export interface BoardSettings {
@@ -54,7 +57,22 @@ export interface BoardStatus {
   cameras: CameraInfo[];
   message?: string;
   version: string;
+  /**
+   * What the board client may do on request: reboot needs ALLOW_REBOOT + host D-Bus on the Pi,
+   * update needs the auto-update container (profile "autoupdate") next to the board client.
+   */
+  capabilities?: { restart: boolean; reboot: boolean; update?: boolean };
 }
+
+export type BoardCommand = 'start' | 'stop' | 'reset' | 'rescan' | 'restart' | 'reboot' | 'update';
+
+/**
+ * Camera stream views: "raw" = what the camera sees, "front" = the calibrated camera image
+ * warped to a frontal view of the board (same mm coordinates as the virtual board, ±BOARD_VIEW).
+ */
+export type StreamView = 'raw' | 'front';
+/** Half width of the frontal view in mm (matches the viewBox of the virtual dartboard). */
+export const BOARD_VIEW = 232;
 
 export interface DetectedDart {
   id: string;
@@ -83,7 +101,7 @@ export type BoardToServer =
   | { type: 'dart'; dart: DetectedDart }
   | { type: 'takeout_started' }
   | { type: 'takeout_finished' }
-  | { type: 'frame'; camera: number; data: string; width: number; height: number }
+  | { type: 'frame'; camera: number; data: string; width: number; height: number; view?: StreamView }
   | { type: 'snapshot'; requestId: string; camera: number; data: string | null; width: number; height: number }
   | { type: 'calibration'; calibration: Record<string, CameraCalibration | null> }
   | { type: 'settings'; settings: BoardSettings }
@@ -91,11 +109,19 @@ export type BoardToServer =
 
 // ---------------------------------------------------------------- server -> board
 export type ServerToBoard =
-  | { type: 'welcome'; claimed: boolean; pairingCode: string | null; name: string | null }
-  | { type: 'stream'; enabled: boolean; fps: number; maxWidth: number }
+  | {
+      type: 'welcome';
+      claimed: boolean;
+      pairingCode: string | null;
+      name: string | null;
+      /** Last known calibration per camera id – the board restores it if it lost its own. */
+      calibrationBackup?: Record<string, CameraCalibration>;
+    }
+  /** raw: send camera images; front: cameras (indices) to send as frontal view. */
+  | { type: 'stream'; enabled: boolean; fps: number; maxWidth: number; raw: boolean; front: number[] }
   | { type: 'snapshot_request'; requestId: string; camera: number }
   | { type: 'set_calibration'; camera: number; calibration: CameraCalibration | null }
-  | { type: 'command'; action: 'start' | 'stop' | 'reset' | 'rescan' }
+  | { type: 'command'; action: BoardCommand }
   | { type: 'set_settings'; settings: Partial<BoardSettings> }
   | { type: 'ping' }
   | { type: 'error'; message: string };
@@ -104,7 +130,8 @@ export type ServerToBoard =
 export type ClientToServer =
   | { type: 'subscribe_match'; matchId: string }
   | { type: 'unsubscribe_match'; matchId: string }
-  | { type: 'subscribe_board'; boardId: string; stream?: boolean }
+  /** stream: raw camera images, front: camera indices wanted as frontal view. */
+  | { type: 'subscribe_board'; boardId: string; stream?: boolean; front?: number[] }
   | { type: 'unsubscribe_board'; boardId: string }
   | { type: 'ping' };
 
@@ -119,6 +146,30 @@ export interface MatchSummary {
   winner: number | null;
   createdAt: string;
   finishedAt: string | null;
+  /** Voice pack of the player who created the match (null = standard voice). */
+  voice?: MatchVoice | null;
+}
+
+/** The running match that currently occupies a board. */
+export interface BoardActiveMatch {
+  id: string;
+  ownerId: string;
+  ownerName: string;
+  title: string;
+  players: string[];
+  /** Last thrown dart (or start of the match), ISO date. */
+  lastActivity: string;
+}
+
+/** guest = player of a remote match who may watch that board while the match runs. */
+export type BoardRole = 'owner' | 'member' | 'guest';
+
+export interface BoardMember {
+  userId: string;
+  username: string;
+  displayName: string;
+  role: BoardRole;
+  online: boolean;
 }
 
 export interface BoardSummary {
@@ -129,14 +180,44 @@ export interface BoardSummary {
   calibration: Record<string, CameraCalibration | null>;
   settings: BoardSettings | null;
   activeMatchId: string | null;
+  activeMatch: BoardActiveMatch | null;
   lastSeen: string | null;
+  /** Role of the requesting user (boards can be shared: n users <-> m boards). */
+  role: BoardRole;
+  /** Code with which further players add the board to their account (rotates after every use). */
+  pairingCode: string | null;
+  memberCount: number;
+}
+
+/** A user as seen by a friend. */
+export interface FriendUser {
+  id: string;
+  username: string;
+  displayName: string;
+  online: boolean;
+  /** Running match the friend is playing in (if any). */
+  playing: { matchId: string; title: string } | null;
+}
+
+export interface FriendsOverview {
+  friends: FriendUser[];
+  /** Friend requests to me. */
+  incoming: FriendUser[];
+  /** My open friend requests. */
+  outgoing: FriendUser[];
 }
 
 export type ServerToClient =
   | { type: 'match_state'; matchId: string; status: MatchStatus; boardId: string | null; state: MatchState }
   | { type: 'board_status'; board: BoardSummary }
-  | { type: 'board_frame'; boardId: string; camera: number; data: string; width: number; height: number }
+  | { type: 'board_frame'; boardId: string; camera: number; data: string; width: number; height: number; view: StreamView }
   | { type: 'board_dart'; boardId: string; dart: DetectedDart }
   | { type: 'board_event'; boardId: string; event: 'takeout_started' | 'takeout_finished' }
+  /** A friend came online / went offline. */
+  | { type: 'presence'; userId: string; online: boolean }
+  /** Friend requests or friendships changed – reload the friends list. */
+  | { type: 'friends_changed' }
+  /** Somebody added me as a player to a new match. */
+  | { type: 'match_invite'; match: MatchSummary; from: { id: string; displayName: string } }
   | { type: 'pong' }
   | { type: 'error'; message: string };

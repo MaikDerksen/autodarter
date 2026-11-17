@@ -1,10 +1,16 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import { Pressable, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
 import {
+  atcTarget,
+  dartKey,
+  dartSay,
   describeSettings,
+  scoreKey,
+  scoreSay,
   segmentCenter,
+  type BoardSummary,
   type DartView,
   type MatchState,
   type MatchStatus,
@@ -12,25 +18,31 @@ import {
   type Segment,
   type TurnView,
 } from '@shared';
+import { BoardTools } from '@/components/BoardTools';
 import { Dartboard, type BoardHit } from '@/components/Dartboard';
 import { Keypad } from '@/components/Keypad';
-import { CricketScoreboard, X01Scoreboard } from '@/components/Scoreboards';
-import { Badge, Button, Card, ErrorText, H2, Loading, P, Row, Screen, Segmented, Stat } from '@/components/ui';
+import { AtcScoreboard, CricketScoreboard, X01Scoreboard } from '@/components/Scoreboards';
+import { Badge, Button, Card, ErrorText, H2, Loading, Row, Screen, Segmented, Stat } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
 import { boardBadge } from '@/lib/boardState';
-import { callerAvailable, say } from '@/lib/caller';
+import { useAuth } from '@/lib/auth';
+import { announce, callerAvailable, type Call } from '@/lib/caller';
 import { confirm } from '@/lib/confirm';
 import { useBoardLive, useMatchLive } from '@/lib/live';
 import { getItem, setItem } from '@/lib/storage';
 import { colors, radius } from '@/lib/theme';
 
-const DART_COLORS = ['#38bdf8', '#facc15', '#f472b6'];
+/** How long the finished turn stays visible before the next player is shown (matches without board). */
+const TURN_HOLD_MS = 1800;
 
-function hitsFor(darts: DartView[], faded = false): BoardHit[] {
+/** 'virtual' = drawn board, otherwise the camera index of the frontal camera view. */
+type BoardView = 'virtual' | number;
+
+function hitsFor(darts: DartView[]): BoardHit[] {
   const out: BoardHit[] = [];
   darts.forEach((d, i) => {
     const pos = d.x !== undefined && d.y !== undefined ? { x: d.x, y: d.y } : segmentCenter(d.seg);
-    if (pos) out.push({ ...pos, color: faded ? '#94a3b8' : DART_COLORS[i % 3], label: String(i + 1) });
+    if (pos) out.push({ ...pos, label: String(i + 1) });
   });
   return out;
 }
@@ -43,45 +55,132 @@ function previousTurn(state: MatchState): TurnView | null {
   return null;
 }
 
-function callText(state: MatchState, turn: TurnView): string | null {
+const GAME_SHOT: Call = { key: 'game_shot', text: 'Game shot!' };
+const GAME_SHOT_MATCH: Call = { key: 'game_shot_match', text: 'Game shot, and the match!' };
+
+/** Call for a finished turn: x01 announces the score, all modes the won leg / match. */
+function turnCall(state: MatchState, turn: TurnView, wonLeg: boolean): Call | null {
   if (state.settings.mode === 'x01') {
-    if (turn.bust) return 'Bust';
-    if (turn.checkout) return state.finished ? 'Game shot, and the match!' : 'Game shot!';
-    return turn.points === 0 ? 'No score' : String(turn.points);
+    if (turn.bust) return { key: 'bust', text: 'Bust' };
+    if (turn.checkout) {
+      const shot = state.finished ? GAME_SHOT_MATCH : GAME_SHOT;
+      // a recorded "Big Fish" replaces the game shot call on a 170 checkout
+      return turn.points === 170 ? { key: 'big_fish', text: shot.text } : shot;
+    }
+    return { key: scoreKey(turn.points), text: scoreSay(turn.points) };
   }
-  if (state.finished) return 'Game shot, and the match!';
+  if (state.finished) return GAME_SHOT_MATCH;
+  return wonLeg ? GAME_SHOT : null;
+}
+
+/** Highlighted numbers: cricket = still in play, around the clock = the next target of the player. */
+function openTargets(state: MatchState, player: number): number[] | undefined {
+  if (state.settings.mode === 'atc') {
+    const t = atcTarget(state, player);
+    return t === null ? [] : [t];
+  }
+  const c = state.cricket;
+  if (state.settings.mode !== 'cricket' || !c) return undefined;
+  return c.targets.filter((_, ti) => !c.marks.every((m) => m[ti] >= 3));
+}
+
+/** Status ring like on the real board: green = throw, orange = pull darts, red = not ready. */
+function ringColor(board: BoardSummary | null, state: MatchState, status: MatchStatus): string | null {
+  if (status !== 'running' || state.finished) return null;
+  if (!board || !board.online) return colors.danger;
+  const s = board.status?.state;
+  if (state.awaitingNext || s === 'takeout' || s === 'takeout_in_progress') return colors.warning;
+  if (s === 'throw' && board.status?.detecting) return colors.accent;
+  return colors.danger;
+}
+
+/** Why the board does not count darts right now – null while everything is fine. */
+function boardProblem(board: BoardSummary): string | null {
+  if (!board.online) return 'Board ist offline';
+  const s = board.status;
+  if (!s) return null;
+  if (!s.detecting) return 'Erkennung ist gestoppt';
+  if (s.state === 'calibration_needed') return 'Board muss kalibriert werden';
+  if (s.state === 'error') return 'Board meldet einen Fehler';
+  if (s.cameras.some((c) => !c.ok)) return 'Eine Kamera liefert kein Bild';
   return null;
 }
 
 export default function MatchScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
+  const { user } = useAuth();
   const { width } = useWindowDimensions();
   const wide = width >= 900;
   const [match, setMatch] = useState<MatchSummary | null>(null);
   const [state, setState] = useState<MatchState | null>(null);
   const [status, setStatus] = useState<MatchStatus>('running');
+  const [canControl, setCanControl] = useState(true);
   const [inputMode, setInputMode] = useState<'board' | 'keypad'>('board');
-  const [selected, setSelected] = useState<number | null>(null);
+  const [chosenView, setView] = useState<BoardView>('virtual');
+  const [chosenDart, setSelected] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [callerOn, setCallerOn] = useState(false);
-  const announced = useRef<Set<number> | null>(null);
+  const [toolsOpen, setToolsOpen] = useState(false);
+  const [remoteOpen, setRemoteOpen] = useState(false);
+  const [myBoards, setMyBoards] = useState<BoardSummary[] | null>(null);
+  /** finished turn that is still shown for a moment after the switch to the next player */
+  const [hold, setHold] = useState<TurnView | null>(null);
+  const announced = useRef<Set<string> | null>(null);
+  const stateRef = useRef<MatchState | null>(null);
+  const boardRef = useRef<string | null>(null);
 
-  const board = useBoardLive(match?.boardId ?? null);
+  const [frontCam, setFrontCam] = useState<number | null>(null);
+  // remote play: show the board of the player whose turn it is
+  const turnPlayer = state ? (hold && state.turn.darts.length === 0 ? hold.player : state.currentPlayer) : 0;
+  const viewBoardId = (state?.players[turnPlayer]?.boardId ?? match?.boardId) || null;
+  const live = useBoardLive(viewBoardId, { front: frontCam });
+  const board = live.board;
+  // the chosen camera may be gone / not calibrated -> virtual board
+  const cams = (board?.status?.cameras ?? []).filter((c) => c.calibrated);
+  const view: BoardView = typeof chosenView === 'number' && board && !cams.some((c) => c.index === chosenView) ? 'virtual' : chosenView;
+  const wantedFront = typeof view === 'number' ? view : null;
+  if (wantedFront !== frontCam) setFrontCam(wantedFront);
+  // without a board the next player is up right after the 3rd dart – keep the finished turn visible for a moment
+  const shownTurn: TurnView | null = state ? (hold && state.turn.darts.length === 0 ? hold : state.turn) : null;
+  const holding = !!state && shownTurn !== state.turn;
+  // a correction only makes sense for darts of the visible turn
+  const selected = chosenDart !== null && shownTurn?.darts.some((d) => d.eventIndex === chosenDart) ? chosenDart : null;
 
   useEffect(() => {
     getItem('autodarter.input').then((v) => (v === 'keypad' || v === 'board') && setInputMode(v));
     getItem('autodarter.caller').then((v) => setCallerOn(v === '1'));
+    getItem('autodarter.view').then((v) => v && v !== 'virtual' && Number.isInteger(Number(v)) && setView(Number(v)));
   }, []);
 
-  const applyState = useCallback((s: MatchState) => setState(s), []);
+  const applyState = useCallback((s: MatchState) => {
+    const old = stateRef.current;
+    stateRef.current = s;
+    setState(s);
+    if (!old || boardRef.current) return;
+    // the turn of the previous player just ended (3rd dart, bust or checkout) -> show it briefly
+    const prev = previousTurn(s);
+    const last = prev?.darts[prev.darts.length - 1];
+    if (s.eventCount > old.eventCount && s.turn.darts.length === 0 && prev?.complete && last && last.eventIndex >= old.eventCount) {
+      setHold(prev);
+    }
+  }, []);
+
+  // release the held turn after a moment (not while one of its darts is being corrected)
+  useEffect(() => {
+    if (!hold || chosenDart !== null) return;
+    const t = setTimeout(() => setHold(null), TURN_HOLD_MS);
+    return () => clearTimeout(t);
+  }, [hold, chosenDart]);
 
   useEffect(() => {
     if (!id) return;
-    api<{ match: MatchSummary; state: MatchState }>(`/api/matches/${id}`)
+    api<{ match: MatchSummary; state: MatchState; canControl: boolean }>(`/api/matches/${id}`)
       .then((r) => {
+        boardRef.current = r.match.boardId;
         setMatch(r.match);
         setStatus(r.match.status);
+        setCanControl(r.canControl);
         applyState(r.state);
       })
       .catch((e) => setError(errorMessage(e)));
@@ -92,26 +191,29 @@ export default function MatchScreen() {
     setStatus(m.status);
   });
 
-  // caller: announce completed turns once
+  // caller: x01 announces every finished turn, cricket every single dart – each only once
   useEffect(() => {
     if (!state) return;
-    const candidates: TurnView[] = [];
-    const prev = previousTurn(state);
-    if (prev) candidates.push(prev);
-    if (state.turn.complete) candidates.push(state.turn);
+    const perDart = state.settings.mode !== 'x01';
+    const items: { key: string; call: Call | null }[] = [];
+    for (const t of [previousTurn(state), state.turn]) {
+      if (!t || !t.darts.length) continue;
+      if (perDart) t.darts.forEach((d) => items.push({ key: `d${d.eventIndex}`, call: { key: dartKey(d.seg), text: dartSay(d.seg) } }));
+      const wonLeg = t === state.turn && state.legFinished;
+      if (t.complete) items.push({ key: `t${t.darts[t.darts.length - 1].eventIndex}`, call: turnCall(state, t, wonLeg) });
+    }
     if (announced.current === null) {
-      announced.current = new Set(candidates.filter((t) => t.darts.length).map((t) => t.darts[0].eventIndex));
+      announced.current = new Set(items.map((i) => i.key));
       return;
     }
-    for (const t of candidates) {
-      if (!t.darts.length || !t.complete) continue;
-      const key = t.darts[0].eventIndex;
-      if (announced.current.has(key)) continue;
-      announced.current.add(key);
-      const text = callText(state, t);
-      if (callerOn && text) say(text);
+    // undo: forget what was taken back, so it is called again when it is thrown again
+    for (const key of [...announced.current]) if (Number(key.slice(1)) >= state.eventCount) announced.current.delete(key);
+    for (const it of items) {
+      if (announced.current.has(it.key)) continue;
+      announced.current.add(it.key);
+      if (callerOn && it.call) announce(match?.voice, it.call);
     }
-  }, [state, callerOn]);
+  }, [state, callerOn, match?.voice]);
 
   const run = async (fn: () => Promise<{ state?: MatchState } | unknown>) => {
     setBusy(true);
@@ -143,31 +245,60 @@ export default function MatchScreen() {
     );
   }
 
-  const player = state.players[state.currentPlayer];
-  const turnDarts = state.turn.darts;
-  const prev = previousTurn(state);
-  const showPrev = turnDarts.length === 0 && prev && prev.darts.length > 0;
-  const editableDarts = showPrev ? prev!.darts : turnDarts;
-  const boardHits = [...(showPrev ? hitsFor(prev!.darts, true) : []), ...hitsFor(turnDarts)];
-  const badge = match.boardId ? boardBadge(board.board) : null;
+  const turn = shownTurn ?? state.turn;
+  const player = state.players[holding ? turn.player : state.currentPlayer];
+  const turnDarts = turn.darts;
+  const badge = viewBoardId ? boardBadge(board) : null;
   const legWinner = state.legFinished && !state.finished ? state.legs[state.legs.length - 1].winner : null;
   const boardSize = Math.min(wide ? Math.min(520, (width - 64) * 0.45) : width - 32, 520);
-  const cricketTargets = state.settings.mode === 'cricket' ? state.cricket?.targets : undefined;
+  const targets = openTargets(state, holding ? turn.player : state.currentPlayer);
+  const atc = state.settings.mode === 'atc';
+  const myIndex = user ? state.players.findIndex((p) => p.userId === user.id) : -1;
+  const turnBoardName = state.players[turn.player]?.boardId ? state.players[turn.player]?.boardName : null;
+  const ring = viewBoardId ? ringColor(board, state, status) : null;
+  const frontFrame = typeof view === 'number' ? live.frontFrames[view] : undefined;
+  const inputLocked = !canControl || state.finished || (state.awaitingNext && selected === null);
+  // technical tools (reset, calibration, restart) for board members while the match runs
+  const tools = !!viewBoardId && !!board && board.role !== 'guest' && status === 'running' && !state.finished;
+  const problem = tools && board ? boardProblem(board) : null;
 
   const toggleInput = (v: 'board' | 'keypad') => {
     setInputMode(v);
     void setItem('autodarter.input', v);
   };
+  const changeView = (v: BoardView) => {
+    setView(v);
+    void setItem('autodarter.view', String(v));
+  };
   const toggleCaller = () => {
     const v = !callerOn;
     setCallerOn(v);
     void setItem('autodarter.caller', v ? '1' : '0');
-    if (v) say('Game on');
+    if (v) announce(match.voice, { key: 'game_on', text: 'Game on' });
   };
+
+  const openRemote = () => {
+    setRemoteOpen(!remoteOpen);
+    if (!myBoards) {
+      api<BoardSummary[]>('/api/boards')
+        .then(setMyBoards)
+        .catch((e) => setError(errorMessage(e)));
+    }
+  };
+  const chooseBoard = (boardId: string | null) =>
+    run(async () => {
+      const res = await api<{ match: MatchSummary; state: MatchState }>(`/api/matches/${id}/players/${myIndex}/board`, {
+        method: 'PUT',
+        body: { boardId },
+      });
+      setMatch(res.match);
+      setRemoteOpen(false);
+      return res;
+    });
 
   const rematch = async () => {
     await run(async () => {
-      const players = [...match.players.slice(1), match.players[0]].map((p) => ({ name: p.name, self: !!p.userId }));
+      const players = [...match.players.slice(1), match.players[0]].map((p) => (p.userId ? { userId: p.userId } : { name: p.name }));
       const res = await api<{ match: MatchSummary }>('/api/matches', {
         body: { settings: match.settings, players, boardId: match.boardId },
       });
@@ -182,80 +313,223 @@ export default function MatchScreen() {
     }
   };
 
+  // One line with a fixed height below the dart slots – the panel never changes its size.
+  let info: ReactNode = null;
+  if (error) {
+    info = (
+      <>
+        <Ionicons name="alert-circle" size={16} color={colors.danger} />
+        <Text style={[s.infoText, { color: '#fecaca' }]} numberOfLines={1}>
+          {error}
+        </Text>
+      </>
+    );
+  } else if (selected !== null) {
+    info = (
+      <>
+        <Ionicons name="create" size={16} color={colors.warning} />
+        <Text style={[s.infoText, { color: colors.warning }]} numberOfLines={1}>
+          Korrektur: tippe das richtige Segment
+        </Text>
+        <Button small variant="ghost" title="Abbrechen" onPress={() => setSelected(null)} />
+      </>
+    );
+  } else if (holding) {
+    info = (
+      <>
+        <Ionicons name="arrow-forward-circle" size={16} color={colors.accent} />
+        <Text style={[s.infoText, { color: colors.accent }]} numberOfLines={1}>
+          {legWinner !== null ? `Leg an ${state.players[legWinner].name}! ` : ''}Gleich ist {state.players[state.currentPlayer].name} dran …
+        </Text>
+      </>
+    );
+  } else if (problem) {
+    info = (
+      <>
+        <Ionicons name="warning" size={16} color={colors.danger} />
+        <Text style={[s.infoText, { color: '#fecaca' }]} numberOfLines={1}>
+          {problem}
+        </Text>
+        <Button small variant="secondary" icon="construct" title="Technik" onPress={() => setToolsOpen(true)} />
+      </>
+    );
+  } else if (!canControl) {
+    info = (
+      <>
+        <Ionicons name="eye" size={16} color={colors.muted} />
+        <Text style={s.infoText}>Du schaust zu – eingeben können nur die Mitspieler.</Text>
+      </>
+    );
+  } else if (legWinner !== null) {
+    info = (
+      <>
+        <Ionicons name="trophy" size={16} color={colors.warning} />
+        <Text style={[s.infoText, { color: colors.warning, fontWeight: '800' }]} numberOfLines={1}>
+          Leg an {state.players[legWinner].name}!{match.boardId ? ' Darts ziehen – dann geht es weiter.' : ''}
+        </Text>
+      </>
+    );
+  } else if (atc && !state.awaitingNext && !state.finished && atcTarget(state, state.currentPlayer) !== null) {
+    const t = atcTarget(state, state.currentPlayer);
+    info = (
+      <>
+        <Text style={s.checkoutLabel}>Ziel</Text>
+        <View style={s.chip}>
+          <Text style={s.chipText}>{t === 25 ? 'Bull' : t}</Text>
+        </View>
+        <Text style={[s.infoText, { color: colors.faint }]} numberOfLines={1}>
+          {state.settings.mode === 'atc' && state.settings.hits !== 'any' ? (state.settings.hits === 'double' ? 'nur Double' : 'nur Triple') : ''}
+        </Text>
+      </>
+    );
+  } else if (state.checkout && !state.awaitingNext) {
+    info = (
+      <>
+        <Text style={s.checkoutLabel}>Checkout</Text>
+        {state.checkout.map((c, i) => (
+          <View key={i} style={s.chip}>
+            <Text style={s.chipText}>{c}</Text>
+          </View>
+        ))}
+      </>
+    );
+  } else if (state.awaitingNext && match.boardId && !state.finished) {
+    info = (
+      <>
+        <Ionicons name="hand-left" size={16} color={colors.warning} />
+        <Text style={[s.infoText, { color: colors.warning }]} numberOfLines={1}>
+          Darts ziehen – danach ist {state.players[(state.currentPlayer + 1) % state.players.length].name} dran.
+        </Text>
+      </>
+    );
+  } else if (turnDarts.length > 0 && !state.finished) {
+    info = (
+      <Text style={[s.infoText, { color: colors.faint }]} numberOfLines={1}>
+        Falsch erkannt? Dart antippen und korrigieren.
+      </Text>
+    );
+  }
+
   const turnPanel = (
     <Card style={{ gap: 10 }}>
-      <Row style={{ justifyContent: 'space-between' }} wrap>
-        <View>
-          <Text style={s.turnTitle}>{state.finished ? 'Spiel beendet' : player.name}</Text>
+      <Row style={{ justifyContent: 'space-between' }}>
+        <View style={{ flexShrink: 1 }}>
+          <Text style={s.turnTitle} numberOfLines={1}>
+            {state.finished ? 'Spiel beendet' : player.name}
+          </Text>
           <Text style={s.turnSub}>
-            Leg {state.legs.length} · Runde {state.round}
+            Leg {state.legs.length} · Runde {holding && state.currentPlayer <= turn.player ? Math.max(1, state.round - 1) : state.round}
             {state.settings.mode === 'cricket' && state.settings.maxRounds ? ` / ${state.settings.maxRounds}` : ''}
+            {turnBoardName ? ` · an ${turnBoardName}` : ''}
           </Text>
         </View>
-        {badge ? <Badge {...badge} icon="videocam" /> : <Badge label="Manuelle Eingabe" color={colors.info} icon="keypad" />}
+        {!canControl ? (
+          <Badge label="Zuschauer" color={colors.muted} icon="eye" />
+        ) : badge ? (
+          <Badge {...badge} icon="videocam" />
+        ) : (
+          <Badge label="Manuelle Eingabe" color={colors.info} icon="keypad" />
+        )}
       </Row>
 
-      {showPrev ? <Text style={s.prevLabel}>Letzte Aufnahme · {state.players[prev!.player].name} (antippen zum Korrigieren)</Text> : null}
       <View style={s.slots}>
         {[0, 1, 2].map((i) => {
-          const d = editableDarts[i];
+          const d = turnDarts[i];
           const isSel = d && selected === d.eventIndex;
           return (
             <Pressable
               key={i}
-              disabled={!d}
+              disabled={!d || !canControl}
               onPress={() => d && setSelected(isSel ? null : d.eventIndex)}
-              style={[s.slot, d && { borderColor: showPrev ? colors.border : DART_COLORS[i] }, isSel && s.slotSelected]}
+              style={[s.slot, d && s.slotFilled, isSel && s.slotSelected]}
             >
               <Text style={[s.slotText, !d && { color: colors.faint }]}>{d ? d.label : '–'}</Text>
-              {d && state.settings.mode === 'x01' ? <Text style={s.slotPts}>{d.points}</Text> : null}
+              <Text style={[s.slotPts, atc && d ? { color: d.hit ? colors.accent : colors.faint } : null]}>
+                {d && state.settings.mode === 'x01' ? d.points : d && atc ? (d.hit ? 'Treffer' : 'daneben') : ' '}
+              </Text>
             </Pressable>
           );
         })}
         <View style={[s.slot, s.total]}>
-          <Text style={s.slotText}>
-            {showPrev ? (prev!.bust ? 'BUST' : prev!.points) : state.turn.bust ? 'BUST' : state.turn.points}
-          </Text>
-          <Text style={s.slotPts}>{state.settings.mode === 'x01' ? 'Punkte' : `${showPrev ? prev!.marks : state.turn.marks} Marks`}</Text>
+          <Text style={s.slotText}>{turn.bust ? 'BUST' : atc ? turn.marks : turn.points}</Text>
+          <Text style={s.slotPts}>{state.settings.mode === 'x01' ? 'Punkte' : atc ? 'Treffer' : `${turn.marks} Marks`}</Text>
         </View>
       </View>
-      {selected !== null ? (
-        <Row>
-          <Ionicons name="create" size={16} color={colors.warning} />
-          <Text style={{ color: colors.warning, flex: 1 }}>Korrektur: wähle das richtige Segment</Text>
-          <Button small variant="ghost" title="Abbrechen" onPress={() => setSelected(null)} />
-        </Row>
-      ) : null}
 
-      {state.checkout ? (
-        <Row wrap>
-          <Text style={s.checkoutLabel}>Checkout</Text>
-          {state.checkout.map((c, i) => (
-            <View key={i} style={s.chip}>
-              <Text style={s.chipText}>{c}</Text>
-            </View>
-          ))}
-        </Row>
-      ) : null}
+      <View style={s.info}>{info}</View>
 
-      {state.awaitingNext && match.boardId ? (
-        <P muted>{state.legFinished ? 'Leg beendet.' : 'Aufnahme beendet.'} Darts ziehen – oder „Weiter“ drücken.</P>
-      ) : null}
-
-      <Row wrap>
-        <Button title="Rückgängig" icon="arrow-undo" variant="secondary" onPress={() => run(() => api(`/api/matches/${id}/undo`, { body: {} }))} disabled={busy || state.eventCount === 0} />
+      <Row>
         <Button
-          title={state.legFinished ? 'Nächstes Leg' : 'Weiter'}
+          title="Rückgängig"
+          icon="arrow-undo"
+          variant="secondary"
+          onPress={() => run(() => api(`/api/matches/${id}/undo`, { body: {} }))}
+          disabled={busy || !canControl || state.eventCount === 0}
+        />
+        <Button
+          title={state.legFinished && !state.finished ? 'Nächstes Leg' : 'Weiter'}
           icon="play-forward"
-          variant={state.awaitingNext ? 'primary' : 'secondary'}
+          variant={state.awaitingNext && !state.finished ? 'primary' : 'secondary'}
           onPress={() => run(() => api(`/api/matches/${id}/next`, { body: {} }))}
-          disabled={busy || state.finished}
+          disabled={busy || !canControl || state.finished}
           style={{ flexGrow: 1 }}
         />
       </Row>
-      <ErrorText>{error}</ErrorText>
     </Card>
   );
+
+  // remote play: a player throws at their own board (e.g. at home) – default is the board of the match
+  const myBoard = myIndex >= 0 ? state.players[myIndex].boardId ?? null : null;
+  const remotePanel =
+    myIndex >= 0 && status === 'running' && !state.finished && match.boardId ? (
+      <Card style={{ gap: 10 }}>
+        <Pressable onPress={openRemote} style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }} accessibilityRole="button">
+          <Ionicons name="globe-outline" size={18} color={myBoard ? colors.info : colors.muted} />
+          <Text style={[s.infoText, { color: myBoard ? colors.text : colors.muted }]} numberOfLines={1}>
+            {myBoard ? `Du wirfst remote an ${state.players[myIndex].boardName ?? 'deinem Board'}` : 'Remote spielen – an deinem eigenen Board werfen'}
+          </Text>
+          <Ionicons name={remoteOpen ? 'chevron-up' : 'chevron-down'} size={16} color={colors.muted} />
+        </Pressable>
+        {remoteOpen ? (
+          <View style={{ gap: 6 }}>
+            <Text style={{ color: colors.faint, fontSize: 13 }}>
+              Standard: alle werfen am Board des Spiels. Wer woanders steht, wählt hier sein eigenes Board – gezählt wird dann immer das
+              Board des Spielers, der dran ist.
+            </Text>
+            <View style={s.viewRow}>
+              <Pressable onPress={() => chooseBoard(null)} style={[s.viewChip, !myBoard && s.viewChipActive]}>
+                <Ionicons name="home" size={14} color={!myBoard ? colors.text : colors.muted} />
+                <Text style={[s.viewChipText, !myBoard && { color: colors.text }]}>Board des Spiels</Text>
+              </Pressable>
+              {(myBoards ?? [])
+                .filter((b) => b.id !== match.boardId)
+                .map((b) => (
+                  <Pressable
+                    key={b.id}
+                    onPress={() => chooseBoard(b.id)}
+                    disabled={busy}
+                    style={[s.viewChip, myBoard === b.id && s.viewChipActive, !b.online && { opacity: 0.5 }]}
+                  >
+                    <Ionicons name="videocam" size={14} color={myBoard === b.id ? colors.text : colors.muted} />
+                    <Text style={[s.viewChipText, myBoard === b.id && { color: colors.text }]}>
+                      {b.name}
+                      {b.online ? '' : ' (offline)'}
+                    </Text>
+                  </Pressable>
+                ))}
+            </View>
+            {myBoards && myBoards.filter((b) => b.id !== match.boardId).length === 0 ? (
+              <Text style={{ color: colors.faint, fontSize: 13 }}>Du hast kein weiteres Board in deinem Konto.</Text>
+            ) : null}
+          </View>
+        ) : null}
+      </Card>
+    ) : null;
+
+  const viewOptions: { value: BoardView; label: string }[] = [
+    { value: 'virtual', label: 'Virtuell' },
+    ...cams.map((c) => ({ value: c.index as BoardView, label: `${width < 480 ? 'Cam' : 'Kamera'} ${c.index + 1}` })),
+  ];
 
   const inputPanel = (
     <Card style={{ alignItems: 'center' }}>
@@ -269,14 +543,35 @@ export default function MatchScreen() {
         onChange={toggleInput}
       />
       {inputMode === 'board' ? (
-        <Dartboard
-          size={boardSize}
-          hits={boardHits}
-          highlight={cricketTargets}
-          onSegment={state.finished || (state.awaitingNext && selected === null) ? undefined : (seg) => void throwSegment(seg)}
-        />
+        <>
+          {viewBoardId && cams.length > 0 ? (
+            <View style={s.viewRow}>
+              {viewOptions.map((o) => {
+                const active = o.value === view;
+                return (
+                  <Pressable key={String(o.value)} onPress={() => changeView(o.value)} style={[s.viewChip, active && s.viewChipActive]}>
+                    <Ionicons name={o.value === 'virtual' ? 'disc' : 'videocam'} size={14} color={active ? colors.text : colors.muted} />
+                    <Text style={[s.viewChipText, active && { color: colors.text }]}>{o.label}</Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+          ) : null}
+          {/* constant padding for the status ring glow, so nothing moves when it appears */}
+          <View style={{ padding: viewBoardId ? 10 : 0 }}>
+            <Dartboard
+              size={boardSize - (viewBoardId ? 20 : 0)}
+              hits={hitsFor(turnDarts)}
+              targets={typeof view === 'number' ? undefined : targets}
+              image={typeof view === 'number' ? (frontFrame?.uri ?? null) : null}
+              ring={ring}
+              onSegment={inputLocked ? undefined : (seg) => void throwSegment(seg)}
+            />
+          </View>
+          {typeof view === 'number' && !frontFrame ? <Text style={s.viewHint}>Kamerabild wird geladen …</Text> : null}
+        </>
       ) : (
-        <Keypad onSegment={(seg) => void throwSegment(seg)} disabled={busy || state.finished || (state.awaitingNext && selected === null)} />
+        <Keypad onSegment={(seg) => void throwSegment(seg)} disabled={busy || inputLocked} />
       )}
     </Card>
   );
@@ -288,22 +583,17 @@ export default function MatchScreen() {
           title: describeSettings(state.settings),
           headerRight: () => (
             <Row style={{ marginRight: 8 }} gap={4}>
+              {tools ? <Button small variant="ghost" icon="construct-outline" onPress={() => setToolsOpen(true)} /> : null}
               {callerAvailable() ? (
                 <Button small variant="ghost" icon={callerOn ? 'volume-high' : 'volume-mute'} onPress={toggleCaller} />
               ) : null}
-              {status === 'running' ? <Button small variant="ghost" icon="close-circle" onPress={abort} /> : null}
+              {status === 'running' && canControl ? <Button small variant="ghost" icon="close-circle" onPress={abort} /> : null}
             </Row>
           ),
         }}
       />
       <Screen maxWidth={1400}>
         {status === 'aborted' ? <ErrorText>Dieses Spiel wurde abgebrochen.</ErrorText> : null}
-        {legWinner !== null ? (
-          <View style={s.banner}>
-            <Ionicons name="trophy" size={20} color={colors.warning} />
-            <Text style={s.bannerText}>Leg an {state.players[legWinner].name}!</Text>
-          </View>
-        ) : null}
         {state.finished && state.winner !== null ? (
           <Card style={{ borderColor: colors.accent }}>
             <Row>
@@ -311,21 +601,36 @@ export default function MatchScreen() {
               <H2 style={{ fontSize: 24 }}>{state.players[state.winner].name} gewinnt!</H2>
             </Row>
             <StatsTable state={state} />
-            <Row wrap>
-              <Button title="Revanche" icon="refresh" onPress={rematch} loading={busy} />
-              <Button title="Zur Übersicht" variant="secondary" onPress={() => router.replace('/')} />
-              <Button title="Letzten Wurf zurücknehmen" variant="ghost" icon="arrow-undo" onPress={() => run(() => api(`/api/matches/${id}/undo`, { body: {} }))} />
-            </Row>
+            {canControl ? (
+              <Row wrap>
+                <Button title="Revanche" icon="refresh" onPress={rematch} loading={busy} />
+                <Button title="Zur Übersicht" variant="secondary" onPress={() => router.replace('/')} />
+                <Button
+                  title="Letzten Wurf zurücknehmen"
+                  variant="ghost"
+                  icon="arrow-undo"
+                  onPress={() => run(() => api(`/api/matches/${id}/undo`, { body: {} }))}
+                />
+              </Row>
+            ) : null}
           </Card>
         ) : null}
         <View style={wide ? s.wide : s.narrow}>
           <View style={{ flex: wide ? 1.1 : undefined, gap: 16 }}>
-            {state.settings.mode === 'x01' ? <X01Scoreboard state={state} compact={!wide && state.players.length > 2} /> : <CricketScoreboard state={state} />}
+            {state.settings.mode === 'x01' ? (
+              <X01Scoreboard state={state} compact={!wide && state.players.length > 2} />
+            ) : atc ? (
+              <AtcScoreboard state={state} compact={!wide && state.players.length > 2} />
+            ) : (
+              <CricketScoreboard state={state} compact={!wide} />
+            )}
             {turnPanel}
+            {remotePanel}
           </View>
           <View style={{ flex: wide ? 0.9 : undefined, gap: 16 }}>{inputPanel}</View>
         </View>
       </Screen>
+      {tools && board ? <BoardTools board={board} visible={toolsOpen} onClose={() => setToolsOpen(false)} /> : null}
     </>
   );
 }
@@ -369,35 +674,40 @@ const s = StyleSheet.create({
   narrow: { gap: 16 },
   turnTitle: { color: colors.text, fontSize: 22, fontWeight: '800' },
   turnSub: { color: colors.muted, fontSize: 13, fontWeight: '600' },
-  prevLabel: { color: colors.muted, fontSize: 13 },
   slots: { flexDirection: 'row', gap: 8 },
   slot: {
     flex: 1,
     alignItems: 'center',
     justifyContent: 'center',
-    paddingVertical: 12,
     borderRadius: radius.md,
     borderWidth: 2,
     borderColor: colors.border,
     backgroundColor: colors.bg,
-    minHeight: 72,
+    height: 76,
   },
+  slotFilled: { borderColor: '#3b4a5e', backgroundColor: colors.surfaceAlt },
   slotSelected: { borderColor: colors.warning, backgroundColor: '#2a1f05' },
-  slotText: { color: colors.text, fontSize: 24, fontWeight: '900' },
-  slotPts: { color: colors.muted, fontSize: 12, fontWeight: '600' },
+  slotText: { color: colors.text, fontSize: 24, fontWeight: '900', lineHeight: 30 },
+  slotPts: { color: colors.muted, fontSize: 12, fontWeight: '600', lineHeight: 16 },
   total: { backgroundColor: colors.surfaceAlt, borderColor: colors.surfaceAlt },
-  checkoutLabel: { color: colors.muted, fontWeight: '700', marginRight: 4 },
+  info: { height: 36, flexDirection: 'row', alignItems: 'center', gap: 8, overflow: 'hidden' },
+  infoText: { color: colors.muted, fontSize: 14, flexShrink: 1, flexGrow: 1 },
+  checkoutLabel: { color: colors.muted, fontWeight: '700', marginRight: 2 },
   chip: { backgroundColor: colors.accentDim, borderRadius: 999, paddingHorizontal: 12, paddingVertical: 4 },
   chipText: { color: '#bbf7d0', fontWeight: '800' },
-  banner: {
+  viewRow: { flexDirection: 'row', flexWrap: 'wrap', gap: 6, alignSelf: 'stretch', justifyContent: 'center' },
+  viewChip: {
     flexDirection: 'row',
-    gap: 10,
     alignItems: 'center',
-    backgroundColor: '#2a1f05',
-    borderRadius: radius.md,
-    padding: 12,
+    gap: 6,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 999,
     borderWidth: 1,
-    borderColor: colors.warning,
+    borderColor: colors.border,
+    backgroundColor: colors.bg,
   },
-  bannerText: { color: colors.warning, fontWeight: '800', fontSize: 16 },
+  viewChipActive: { borderColor: colors.accent, backgroundColor: '#0f2418' },
+  viewChipText: { color: colors.muted, fontWeight: '700', fontSize: 13 },
+  viewHint: { color: colors.faint, fontSize: 12 },
 });

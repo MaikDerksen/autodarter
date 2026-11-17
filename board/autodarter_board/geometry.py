@@ -115,6 +115,29 @@ def project3d(K: np.ndarray, R: np.ndarray, t: np.ndarray, pts) -> np.ndarray:
     return uv[:, :2] / uv[:, 2:3]
 
 
+# Half width (mm) of the frontal camera view – same as the viewBox of the virtual board in the app.
+BOARD_VIEW = 232.0
+
+
+def front_view_matrix(H: np.ndarray, size: int) -> np.ndarray:
+    """Matrix mapping output pixels of a size x size frontal view to camera image pixels.
+
+    Output pixel (u, v) shows board point x = -BOARD_VIEW + (u + 0.5) * s, y = BOARD_VIEW - (v + 0.5) * s.
+    Use with cv2.warpPerspective(..., flags=WARP_INVERSE_MAP).
+    """
+    s = 2 * BOARD_VIEW / size
+    A = np.array([[s, 0, -BOARD_VIEW + s / 2], [0, -s, BOARD_VIEW - s / 2], [0, 0, 1.0]])
+    return H @ A
+
+
+def front_view(frame: np.ndarray, H: np.ndarray, size: int) -> np.ndarray:
+    """Warp a camera image with its calibration so that the board looks as if seen from the front."""
+    return cv2.warpPerspective(
+        frame, front_view_matrix(H, size), (size, size),
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_CONSTANT, borderValue=(14, 15, 17),
+    )
+
+
 def circle_points(radius: float, steps: int = 72) -> np.ndarray:
     a = np.linspace(0, 2 * np.pi, steps, endpoint=False)
     return np.column_stack([radius * np.cos(a), radius * np.sin(a)])

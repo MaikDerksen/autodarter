@@ -5,19 +5,39 @@ import asyncio
 import base64
 import json
 import logging
+import os
 import threading
 import time
+from collections import deque
 
 import aiohttp
 import cv2
 
 from . import __version__
 from .cameras import CameraManager
-from .config import CAMERA_SOURCE, CAMERAS, SIM_AUTOCALIBRATE, Store
+from .config import (
+    ALLOW_REBOOT,
+    BUILD_VERSION,
+    CAMERA_SOURCE,
+    CAMERAS,
+    DBUS_SOCKET,
+    SIM_AUTOCALIBRATE,
+    UPDATE_REQUEST,
+    UPDATER_HEARTBEAT,
+    Store,
+)
 from .detector import Detector
-from .geometry import segment_label
+from .geometry import board_to_image_homography, front_view, segment_label
 
 log = logging.getLogger("autodarter")
+
+# Darts / takeouts that happen while the internet connection is down are delivered
+# after the reconnect, as long as they are not older than this.
+OUTBOX_MAX_AGE = 180
+# Somebody threw / pulled darts within this time -> "busy" (the auto-updater waits).
+BUSY_SECONDS = 15 * 60
+# Edge length (px) of the frontal camera view.
+FRONT_SIZE = 520
 
 
 def encode_jpeg(frame, max_width: int | None = None, quality: int = 75) -> tuple[str, int, int]:
@@ -50,13 +70,18 @@ class BoardApp:
         self.pairing_code: str | None = None
         self.board_name: str | None = None
         self.server_error: str | None = None
-        self.stream = {"enabled": False, "fps": 4, "maxWidth": 640}
+        self.stream = {"enabled": False, "fps": 4, "maxWidth": 640, "raw": False, "front": []}
+        self._front_h: dict[int, tuple[tuple, object]] = {}
+        self.last_activity = 0.0
+        self._code_logged = 0.0
         self.last_dart: dict | None = None
         self.proc_fps = 0.0
         self.running = True
         self._reconnect = asyncio.Event()
         self._status_sig = None
         self._cam_lock = threading.Lock()
+        self.outbox: deque[tuple[float, dict]] = deque(maxlen=200)
+        self.notice: str | None = None
 
     # ------------------------------------------------------------------ cameras & calibration
     def start_cameras(self) -> None:
@@ -70,6 +95,7 @@ class BoardApp:
             self.detector.reset()
 
     def apply_calibration(self) -> None:
+        self.resolve_calibration()
         for idx in list(self.detector.cams):
             self.detector.set_calibration(idx, None)
         for s in self.cameras.streams:
@@ -77,11 +103,78 @@ class BoardApp:
             if cal and len(cal.get("points", [])) == 5:
                 self.detector.set_calibration(s.index, [tuple(p) for p in cal["points"]])
 
+    def resolve_calibration(self) -> None:
+        """Find the saved calibration of every camera, even if its id changed.
+
+        Calibrations are never thrown away (darkness, unplugged camera, restart): they stay in
+        data/calibration.json until somebody recalibrates or resets that camera.
+        """
+        store = self.store.calibration
+        changed = False
+        used = {s.cam_id for s in self.cameras.streams}
+        missing = []
+        for s in self.cameras.streams:
+            if s.cam_id in store:
+                entry = store[s.cam_id]
+                if entry.get("index") != s.index or entry.get("device") != getattr(s, "device", None):
+                    entry["index"], entry["device"] = s.index, getattr(s, "device", None)
+                    changed = True
+                continue
+            alias = next((a for a in getattr(s, "aliases", ()) if a in store and a not in used), None)
+            if alias:
+                # same camera, older id format (udev link / device name) -> move it to the stable id
+                store[s.cam_id] = {**store.pop(alias), "index": s.index, "device": getattr(s, "device", None)}
+                used.add(alias)
+                log.info("Kalibrierung von Kamera %d übernommen (%s -> %s)", s.index + 1, alias, s.cam_id)
+                changed = True
+            else:
+                missing.append(s)
+        orphans = {k: v for k, v in store.items() if k not in used and not k.startswith("sim-")}
+        if missing and orphans and len(store) == len(self.cameras.streams):
+            # every camera is there, but some ids are new: take the calibration saved for the same camera number
+            for s in missing:
+                key = next((k for k, v in orphans.items() if v.get("index") == s.index), None)
+                if key is None:
+                    continue
+                store[s.cam_id] = {**store.pop(key), "index": s.index, "device": getattr(s, "device", None)}
+                orphans.pop(key)
+                log.warning("Kamera %d hat eine neue Kennung (%s -> %s) – gespeicherte Kalibrierung übernommen", s.index + 1, key, s.cam_id)
+                changed = True
+        for s in self.cameras.streams:
+            if s.cam_id not in store and orphans:
+                log.warning("Kamera %d (%s) hat keine Kalibrierung – gespeichert sind: %s", s.index + 1, s.cam_id, ", ".join(orphans))
+        if changed:
+            self.store.save_calibration()
+
+    def restore_calibration(self, backup: dict) -> bool:
+        """Calibrations the server kept as backup (keyed by camera id) – used when the Pi lost its own."""
+        restored = False
+        for s in self.cameras.streams:
+            if s.cam_id in self.store.calibration:
+                continue
+            for key in (s.cam_id, *getattr(s, "aliases", ())):
+                cal = backup.get(key)
+                points = cal.get("points") if isinstance(cal, dict) else None
+                if points and len(points) == 5:
+                    self.store.calibration[s.cam_id] = {
+                        "points": [[float(p["x"]), float(p["y"])] if isinstance(p, dict) else [float(p[0]), float(p[1])] for p in points],
+                        "index": s.index,
+                        "device": getattr(s, "device", None),
+                    }
+                    log.warning("Kalibrierung von Kamera %d vom Server wiederhergestellt", s.index + 1)
+                    restored = True
+                    break
+        if restored:
+            self.store.save_calibration()
+            self.apply_calibration()
+            self.detector.reset()
+        return restored
+
     def calibration_by_index(self) -> dict:
         out = {}
         for s in self.cameras.streams:
             cal = self.store.calibration.get(s.cam_id)
-            out[str(s.index)] = {"points": [{"x": p[0], "y": p[1]} for p in cal["points"]]} if cal else None
+            out[str(s.index)] = {"points": [{"x": p[0], "y": p[1]} for p in cal["points"]], "camId": s.cam_id} if cal else None
         return out
 
     def status(self) -> dict:
@@ -110,8 +203,12 @@ class BoardApp:
             message = "Bitte mindestens eine Kamera kalibrieren."
         elif not all(c["calibrated"] for c in cams):
             message = "Nicht alle Kameras sind kalibriert – die Genauigkeit ist reduziert."
+        if self.detector.dark:
+            message = (message + " " if message else "") + "Zu dunkel – die Erkennung wartet auf Licht (Kalibrierung bleibt gespeichert)."
         if self.sim is not None:
             message = (message + " " if message else "") + "Simulationsmodus."
+        if self.notice:
+            message = (message + " " if message else "") + self.notice
         return {
             "state": state,
             "detecting": self.detector.detecting,
@@ -119,8 +216,23 @@ class BoardApp:
             "fps": round(self.proc_fps, 1),
             "cameras": cams,
             "message": message,
-            "version": __version__,
+            "version": BUILD_VERSION or __version__,
+            "capabilities": {"restart": True, "reboot": self.can_reboot(), "update": self.can_update()},
         }
+
+    def can_reboot(self) -> bool:
+        return ALLOW_REBOOT and os.path.exists(DBUS_SOCKET)
+
+    def can_update(self) -> bool:
+        """The auto-update container is running (it touches its heartbeat file every few seconds)."""
+        try:
+            return time.time() - UPDATER_HEARTBEAT.stat().st_mtime < 120
+        except OSError:
+            return False
+
+    @property
+    def busy(self) -> bool:
+        return time.time() - self.last_activity < BUSY_SECONDS
 
     # ------------------------------------------------------------------ detection thread
     def detection_thread(self) -> None:
@@ -145,14 +257,35 @@ class BoardApp:
             time.sleep(max(0.0, period - (time.time() - start)))
 
     # ------------------------------------------------------------------ server connection
-    async def send(self, msg: dict) -> None:
+    async def send(self, msg: dict) -> bool:
         ws = self.ws
-        if ws is None or ws.closed:
-            return
+        if ws is None or ws.closed or not self.connected:
+            return False
         try:
             await ws.send_str(json.dumps(msg))
+            return True
         except Exception as err:  # connection dropped
             log.debug("send failed: %s", err)
+            return False
+
+    async def send_event(self, msg: dict) -> None:
+        """Darts and takeouts must not get lost when the internet connection hiccups."""
+        if self.outbox or not await self.send(msg):
+            self.outbox.append((time.time(), msg))
+            if not self.connected:
+                log.warning("offline – %s buffered (%d waiting)", msg["type"], len(self.outbox))
+            await self.flush_outbox()
+
+    async def flush_outbox(self) -> None:
+        while self.outbox and self.connected:
+            at, msg = self.outbox[0]
+            if time.time() - at > OUTBOX_MAX_AGE:
+                self.outbox.popleft()
+                log.warning("dropping stale %s from %.0fs ago", msg["type"], time.time() - at)
+                continue
+            if not await self.send(msg):
+                return
+            self.outbox.popleft()
 
     async def send_status(self, force: bool = False) -> None:
         st = self.status()
@@ -168,12 +301,16 @@ class BoardApp:
         if url.startswith("http"):
             url = "ws" + url[4:]
         elif not url.startswith("ws"):
-            url = "ws://" + url
+            # no scheme: a domain name means "over the internet" -> encrypted; IP / explicit port -> LAN
+            host = url.split("/")[0]
+            is_lan = ":" in host or host.replace(".", "").isdigit() or host == "localhost"
+            url = ("ws://" if is_lan else "wss://") + url
         return url.rstrip("/") + "/ws/board"
 
     async def server_loop(self) -> None:
         backoff = 1
-        async with aiohttp.ClientSession() as session:
+        # trust_env: honours HTTPS_PROXY / HTTP_PROXY / NO_PROXY (company networks)
+        async with aiohttp.ClientSession(trust_env=True) as session:
             while self.running:
                 url = self.ws_url()
                 if not url:
@@ -183,7 +320,6 @@ class BoardApp:
                 try:
                     async with session.ws_connect(url, heartbeat=20, max_msg_size=32 * 1024 * 1024) as ws:
                         self.ws = ws
-                        self.connected = True
                         self.server_error = None
                         backoff = 1
                         log.info("connected to %s", url)
@@ -200,6 +336,10 @@ class BoardApp:
                                 }
                             )
                         )
+                        self.connected = True  # only after the hello, so nothing overtakes it
+                        if self.outbox:
+                            log.info("delivering %d buffered events", len(self.outbox))
+                            await self.flush_outbox()
                         reconnect_task = asyncio.create_task(self._reconnect.wait())
                         try:
                             async for msg in ws:
@@ -244,13 +384,20 @@ class BoardApp:
             self.claimed = bool(msg.get("claimed"))
             self.pairing_code = msg.get("pairingCode")
             self.board_name = msg.get("name")
-            if self.pairing_code:
-                log.info("=== Kopplungscode: %s ===  (in der Web-App unter Boards > Board hinzufügen eingeben)", self.pairing_code)
-            else:
-                log.info("Board ist mit einem Konto verbunden (%s)", self.board_name)
+            self.log_pairing_code()
+            backup = msg.get("calibrationBackup")
+            if isinstance(backup, dict) and backup and await asyncio.to_thread(self.restore_calibration, backup):
+                await self.send({"type": "calibration", "calibration": self.calibration_by_index()})
             await self.send_status(force=True)
         elif t == "stream":
-            self.stream = {"enabled": bool(msg.get("enabled")), "fps": float(msg.get("fps", 4)), "maxWidth": int(msg.get("maxWidth", 640))}
+            self.stream = {
+                "enabled": bool(msg.get("enabled")),
+                "fps": float(msg.get("fps", 4)),
+                "maxWidth": int(msg.get("maxWidth", 640)),
+                # older servers only know "enabled" = raw camera images
+                "raw": bool(msg.get("raw", msg.get("enabled"))),
+                "front": [int(i) for i in msg.get("front", []) if isinstance(i, int)],
+            }
         elif t == "snapshot_request":
             cam = self.cameras.by_index(int(msg.get("camera", 0)))
             data, w, h = None, 0, 0
@@ -265,7 +412,13 @@ class BoardApp:
                 return
             cal = msg.get("calibration")
             if cal and len(cal.get("points", [])) == 5:
-                self.store.calibration[cam.cam_id] = {"points": [[float(p["x"]), float(p["y"])] for p in cal["points"]]}
+                self.store.calibration[cam.cam_id] = {
+                    "points": [[float(p["x"]), float(p["y"])] for p in cal["points"]],
+                    "index": cam.index,
+                    "device": getattr(cam, "device", None),
+                    "saved": time.time(),
+                }
+                log.info("Kalibrierung von Kamera %d gespeichert (%s)", cam.index + 1, cam.cam_id)
             else:
                 self.store.calibration.pop(cam.cam_id, None)
             self.store.save_calibration()
@@ -289,6 +442,18 @@ class BoardApp:
             self.server_error = msg.get("message")
             log.error("server error: %s", self.server_error)
 
+    def log_pairing_code(self) -> None:
+        """Pairing code as an eye-catching block in the log (headless Pi: docker compose logs board)."""
+        self._code_logged = time.time()
+        if self.claimed:
+            log.info("Board ist mit einem Konto verbunden (%s) – Code für weitere Spieler: %s", self.board_name, self.pairing_code)
+        elif self.pairing_code:
+            line = "=" * 52
+            log.info(
+                "\n%s\n   KOPPLUNGSCODE:  %s\n   In der App: Boards → Board hinzufügen\n   (jederzeit: docker exec autodarter-board autodarter code)\n%s",
+                line, self.pairing_code, line,
+            )
+
     async def command(self, action: str) -> None:
         if action == "start":
             self.detector.set_detecting(True)
@@ -299,7 +464,53 @@ class BoardApp:
         elif action == "rescan":
             await asyncio.to_thread(self.start_cameras)
             await self.send({"type": "calibration", "calibration": self.calibration_by_index()})
+        elif action == "restart":
+            await self.restart_client()
+            return
+        elif action == "reboot":
+            await self.reboot_host()
+        elif action == "update":
+            self.request_update()
         await self.send_status(force=True)
+
+    def request_update(self) -> None:
+        """Ask the auto-update container to pull the newest images now (it restarts this client)."""
+        if not self.can_update():
+            self.notice = "Auto-Update ist nicht aktiv (COMPOSE_PROFILES=autoupdate in board/.env)."
+            return
+        UPDATE_REQUEST.write_text(str(time.time()))
+        self.notice = "Update angefordert – der Board-Client startet gleich neu, falls es eine neue Version gibt."
+        log.warning("update requested")
+
+    async def restart_client(self) -> None:
+        """Exit the process – Docker (restart: unless-stopped) starts it again within seconds."""
+        log.warning("restart requested – exiting, the container restarts automatically")
+        self.notice = "Board-Client startet neu …"
+        await self.send_status(force=True)
+        self.running = False
+        await asyncio.to_thread(self.cameras.stop)
+        if self.ws is not None and not self.ws.closed:
+            await self.ws.close()
+        os._exit(3)
+
+    async def reboot_host(self) -> None:
+        """Reboot the Raspberry Pi via systemd-logind on the host D-Bus (needs ALLOW_REBOOT=true)."""
+        if not self.can_reboot():
+            self.notice = "Pi-Neustart ist nicht freigegeben (ALLOW_REBOOT=true und D-Bus-Socket nötig)."
+            return
+        log.warning("reboot of the host requested")
+        self.notice = "Raspberry Pi startet neu …"
+        await self.send_status(force=True)
+        proc = await asyncio.create_subprocess_exec(
+            "dbus-send", "--system", "--print-reply", "--dest=org.freedesktop.login1",
+            "/org/freedesktop/login1", "org.freedesktop.login1.Manager.Reboot", "boolean:false",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env={**os.environ, "DBUS_SYSTEM_BUS_ADDRESS": f"unix:path={DBUS_SOCKET}"},
+        )
+        _, err = await proc.communicate()
+        if proc.returncode != 0:
+            self.notice = "Pi-Neustart fehlgeschlagen: " + err.decode(errors="replace").strip()[:200]
+            log.error(self.notice)
 
     # ------------------------------------------------------------------ async workers
     async def event_worker(self) -> None:
@@ -307,33 +518,67 @@ class BoardApp:
         while self.running:
             ev = await self.queue.get()
             kind = ev[0]
+            self.last_activity = time.time()
             if kind == "dart":
                 dart = ev[1]
                 self.last_dart = {**dart, "label": segment_label(dart["seg"]["number"], dart["seg"]["multiplier"]), "at": time.time()}
                 log.info("dart %s at (%.1f, %.1f) cams=%s conf=%.2f", self.last_dart["label"], dart["x"], dart["y"], dart["cameras"], dart["confidence"])
-                await self.send({"type": "dart", "dart": dart})
+                await self.send_event({"type": "dart", "dart": dart})
             elif kind in ("takeout_started", "takeout_finished"):
                 log.info(kind)
-                await self.send({"type": kind})
+                await self.send_event({"type": kind})
             await self.send_status()
+
+    def _front_homography(self, s, w: int, h: int):
+        """Board->image homography of a camera at the given frame size (cached)."""
+        cal = self.store.calibration.get(s.cam_id)
+        if not cal or len(cal.get("points", [])) != 5:
+            return None
+        key = (w, h, tuple(tuple(p) for p in cal["points"]))
+        cached = self._front_h.get(s.index)
+        if cached is None or cached[0] != key:
+            cached = (key, board_to_image_homography([tuple(p) for p in cal["points"]], w, h))
+            self._front_h[s.index] = cached
+        return cached[1]
+
+    def encode_front(self, s, frame, size: int):
+        h, w = frame.shape[:2]
+        H = self._front_homography(s, w, h)
+        if H is None:
+            return None
+        return encode_jpeg(front_view(frame, H, size), None, 72)
 
     async def stream_worker(self) -> None:
         while self.running:
-            if self.stream["enabled"] and self.connected:
+            st = self.stream
+            if st["enabled"] and self.connected:
                 start = time.time()
                 for s in list(self.cameras.streams):
                     _, frame = s.latest()
                     if frame is None:
                         continue
-                    data, w, h = await asyncio.to_thread(encode_jpeg, frame, self.stream["maxWidth"], 70)
-                    await self.send({"type": "frame", "camera": s.index, "data": data, "width": w, "height": h})
-                await asyncio.sleep(max(0.05, 1 / max(0.5, self.stream["fps"]) - (time.time() - start)))
+                    if st["raw"]:
+                        data, w, h = await asyncio.to_thread(encode_jpeg, frame, st["maxWidth"], 70)
+                        await self.send({"type": "frame", "camera": s.index, "data": data, "width": w, "height": h, "view": "raw"})
+                    if s.index in st["front"]:
+                        res = await asyncio.to_thread(self.encode_front, s, frame, min(FRONT_SIZE, st["maxWidth"]))
+                        if res is not None:
+                            data, w, h = res
+                            await self.send({"type": "frame", "camera": s.index, "data": data, "width": w, "height": h, "view": "front"})
+                await asyncio.sleep(max(0.05, 1 / max(0.5, st["fps"]) - (time.time() - start)))
             else:
                 await asyncio.sleep(0.3)
 
     async def status_worker(self) -> None:
         while self.running:
             await asyncio.sleep(1)
+            now = time.time()
+            # repeat the code every few minutes while the board is not in an account yet
+            if not self.claimed and self.pairing_code and now - self._code_logged > 300:
+                self.log_pairing_code()
+            if not self.store.server_url and now - self._code_logged > 60:
+                self._code_logged = now
+                log.warning("Keine Server-Adresse gesetzt: AUTODARTER_SERVER in .env oder  docker exec autodarter-board autodarter server https://…")
             await self.send_status()
             if int(time.time()) % 10 == 0:
                 await self.send_status(force=True)  # keeps fps up to date

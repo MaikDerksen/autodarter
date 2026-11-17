@@ -1,9 +1,17 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { BoardSummary, DetectedDart, MatchState, MatchStatus, ServerToClient } from '@shared';
 import { getApiBase, wsUrl } from './api';
 
 type Listener = (msg: ServerToClient) => void;
 export type LiveStatus = 'offline' | 'connecting' | 'online';
+
+interface BoardSub {
+  count: number;
+  /** number of subscribers that want the raw camera images */
+  raw: number;
+  /** camera index -> number of subscribers that want its frontal view */
+  front: Map<number, number>;
+}
 
 /**
  * One shared WebSocket to the server with ref-counted subscriptions that are
@@ -18,7 +26,7 @@ class LiveConnection {
   private listeners = new Set<Listener>();
   private statusListeners = new Set<(s: LiveStatus) => void>();
   private matches = new Map<string, number>();
-  private boards = new Map<string, { count: number; streams: number }>();
+  private boards = new Map<string, BoardSub>();
   status: LiveStatus = 'offline';
 
   configure(token: string | null) {
@@ -55,7 +63,7 @@ class LiveConnection {
       this.retry = 0;
       this.setStatus('online');
       for (const id of this.matches.keys()) this.send({ type: 'subscribe_match', matchId: id });
-      for (const [id, b] of this.boards) this.send({ type: 'subscribe_board', boardId: id, stream: b.streams > 0 });
+      for (const id of this.boards.keys()) this.sendBoard(id);
     };
     ws.onmessage = (ev) => {
       try {
@@ -76,6 +84,13 @@ class LiveConnection {
 
   private send(msg: object) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify(msg));
+  }
+
+  private sendBoard(id: string) {
+    const b = this.boards.get(id);
+    if (!b) return;
+    const front = [...b.front.entries()].filter(([, n]) => n > 0).map(([cam]) => cam);
+    this.send({ type: 'subscribe_board', boardId: id, stream: b.raw > 0, front });
   }
 
   addListener(l: Listener) {
@@ -101,23 +116,28 @@ class LiveConnection {
     };
   }
 
-  subscribeBoard(id: string, stream: boolean) {
-    const b = this.boards.get(id) ?? { count: 0, streams: 0 };
-    const hadStream = b.streams > 0;
+  /**
+   * Subscribe to a board's status. raw: also its camera images; front: the frontal (rectified)
+   * view of this camera index.
+   */
+  subscribeBoard(id: string, opts: { raw?: boolean; front?: number | null } = {}) {
+    const b = this.boards.get(id) ?? { count: 0, raw: 0, front: new Map() };
     b.count++;
-    if (stream) b.streams++;
+    if (opts.raw) b.raw++;
+    if (opts.front != null) b.front.set(opts.front, (b.front.get(opts.front) ?? 0) + 1);
     this.boards.set(id, b);
-    if (b.count === 1 || (stream && !hadStream)) this.send({ type: 'subscribe_board', boardId: id, stream: b.streams > 0 });
+    this.sendBoard(id);
     return () => {
       const cur = this.boards.get(id);
       if (!cur) return;
       cur.count--;
-      if (stream) cur.streams--;
+      if (opts.raw) cur.raw--;
+      if (opts.front != null) cur.front.set(opts.front, (cur.front.get(opts.front) ?? 1) - 1);
       if (cur.count <= 0) {
         this.boards.delete(id);
         this.send({ type: 'unsubscribe_board', boardId: id });
-      } else if (stream && cur.streams === 0) {
-        this.send({ type: 'subscribe_board', boardId: id, stream: false });
+      } else {
+        this.sendBoard(id);
       }
     };
   }
@@ -133,7 +153,10 @@ export function useLiveStatus(): LiveStatus {
 
 export function useLiveMessages(handler: Listener) {
   const ref = useRef(handler);
-  ref.current = handler;
+  // always call the latest handler without re-subscribing
+  useLayoutEffect(() => {
+    ref.current = handler;
+  });
   useEffect(() => live.addListener((m) => ref.current(m)), []);
 }
 
@@ -159,29 +182,34 @@ export interface Frame {
   at: number;
 }
 
-export function useBoardLive(boardId: string | null | undefined, opts: { stream?: boolean } = {}) {
+/**
+ * Live data of a board. stream: raw camera images (board page / calibration),
+ * front: camera index whose frontal view is shown (match page).
+ */
+export function useBoardLive(boardId: string | null | undefined, opts: { stream?: boolean; front?: number | null } = {}) {
   const [board, setBoard] = useState<BoardSummary | null>(null);
   const [frames, setFrames] = useState<Record<number, Frame>>({});
+  const [frontFrames, setFrontFrames] = useState<Record<number, Frame>>({});
   const [lastDart, setLastDart] = useState<DetectedDart | null>(null);
   const [lastEvent, setLastEvent] = useState<{ event: string; at: number } | null>(null);
   const stream = !!opts.stream;
+  const front = opts.front ?? null;
 
   useLiveMessages((msg) => {
     if (!boardId) return;
     if (msg.type === 'board_status' && msg.board.id === boardId) setBoard(msg.board);
     else if (msg.type === 'board_frame' && msg.boardId === boardId) {
-      setFrames((f) => ({
-        ...f,
-        [msg.camera]: { uri: `data:image/jpeg;base64,${msg.data}`, width: msg.width, height: msg.height, at: Date.now() },
-      }));
+      const frame = { uri: `data:image/jpeg;base64,${msg.data}`, width: msg.width, height: msg.height, at: Date.now() };
+      if (msg.view === 'front') setFrontFrames((f) => ({ ...f, [msg.camera]: frame }));
+      else setFrames((f) => ({ ...f, [msg.camera]: frame }));
     } else if (msg.type === 'board_dart' && msg.boardId === boardId) setLastDart(msg.dart);
     else if (msg.type === 'board_event' && msg.boardId === boardId) setLastEvent({ event: msg.event, at: Date.now() });
   });
 
   useEffect(() => {
     if (!boardId) return;
-    return live.subscribeBoard(boardId, stream);
-  }, [boardId, stream]);
+    return live.subscribeBoard(boardId, { raw: stream, front });
+  }, [boardId, stream, front]);
 
-  return { board, frames, lastDart, lastEvent };
+  return { board, frames, frontFrames, lastDart, lastEvent };
 }

@@ -31,7 +31,13 @@ function BoardRow({ board }: { board: BoardSummary }) {
             : board.lastSeen
               ? `Zuletzt online ${new Date(board.lastSeen).toLocaleString()}`
               : 'Noch nie online'}
+          {` · ${board.role === 'owner' ? 'Besitzer' : 'Geteilt'}${board.memberCount > 1 ? ` · ${board.memberCount} Spieler` : ''}`}
         </Text>
+        {board.activeMatch ? (
+          <Text style={{ color: colors.warning, fontSize: 12 }}>
+            Läuft: {board.activeMatch.title} · {board.activeMatch.players.join(' vs. ')}
+          </Text>
+        ) : null}
       </View>
       <Badge {...badge} />
       <Ionicons name="chevron-forward" size={18} color={colors.muted} />
@@ -56,7 +62,7 @@ export default function BoardsScreen() {
   const ids = (boards.data ?? []).map((b) => b.id).join(',');
   useEffect(() => {
     if (!ids) return;
-    const unsubs = ids.split(',').map((id) => live.subscribeBoard(id, false));
+    const unsubs = ids.split(',').map((id) => live.subscribeBoard(id));
     return () => unsubs.forEach((u) => u());
   }, [ids]);
 
@@ -91,7 +97,9 @@ export default function BoardsScreen() {
         <P muted>
           1. Starte den Autodarter Board-Client auf deinem Raspberry Pi (docker compose up -d im Ordner board/).{'\n'}
           2. Öffne http://&lt;IP-des-Pi&gt;:3180 – dort (und im Log) steht der 6-stellige Kopplungscode.{'\n'}
-          3. Gib den Code hier ein. Das Board ist danach fest mit deinem Konto verbunden.
+          3. Gib den Code hier ein.{'\n'}
+          Ein Board kann in mehreren Konten sein: Wer den Code kennt (Pi-Statusseite oder Board-Seite in der App), fügt es
+          ebenfalls hinzu. Der Code ändert sich nach jeder Verwendung.
         </P>
         <Row wrap gap={12} style={{ alignItems: 'flex-end' }}>
           <View style={{ flexGrow: 1, flexBasis: 200 }}>

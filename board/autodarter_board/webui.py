@@ -36,7 +36,7 @@ button.sec{background:#1a232e;color:var(--text);border:1px solid var(--line)}
 <p class="muted" id="servererr"></p></div>
 <div class="card"><div class="row" style="justify-content:space-between"><h2>Erkennung</h2><span id="state" class="pill">…</span></div>
 <p id="msg" class="muted"></p><p id="dart"></p>
-<div class="row"><button class="sec" onclick="cmd('start')">Start</button><button class="sec" onclick="cmd('stop')">Stopp</button><button class="sec" onclick="cmd('reset')">Reset</button>
+<div class="row"><button class="sec" onclick="cmd('start')">Start</button><button class="sec" onclick="cmd('stop')">Stopp</button><button class="sec" onclick="cmd('reset')">Reset</button><button class="sec" onclick="if(confirm('Board-Client neu starten?'))cmd('restart')">Neu starten</button>
 <span id="simctl" style="display:none" class="row"><button onclick="sim('throw')">🎯 Sim: Dart werfen</button><button class="sec" onclick="sim('takeout')">✋ Sim: Darts ziehen</button></span></div></div>
 <div class="card"><h2>Kameras</h2><div class="cams" id="cams"></div></div>
 </main><script>
@@ -49,7 +49,7 @@ async function refresh(){
     if(!serverSet){document.getElementById('server').value=s.server||'';serverSet=true;}
     document.getElementById('servererr').textContent=s.serverError||'';
     const pb=document.getElementById('pairbody');
-    if(s.claimed){pb.innerHTML='<span class="ok">✔ Mit Konto verbunden</span> – Name: <b>'+(s.name||'')+'</b>';}
+    if(s.claimed){pb.innerHTML='<span class="ok">✔ Mit Konto verbunden</span> – Name: <b>'+(s.name||'')+'</b>'+(s.pairingCode?'<p class="muted">Weitere Spieler fügen das Board mit diesem Code in ihrem Konto hinzu (<b>Boards → Board hinzufügen</b>):</p><div class="code">'+s.pairingCode+'</div>':'');}
     else if(s.pairingCode){pb.innerHTML='<div class="code">'+s.pairingCode+'</div><p class="muted">Diesen Code in der Autodarter-Web-App unter <b>Boards → Board hinzufügen</b> eingeben.</p>';}
     else{pb.textContent='Kopplungscode erscheint, sobald der Server erreichbar ist.';}
     const st=document.getElementById('state');st.textContent=s.status.state+' · '+s.status.darts+' Darts · '+s.status.fps+' FPS';
@@ -91,6 +91,8 @@ async def start_webui(app) -> web.AppRunner:
                 "status": app.status(),
                 "lastDart": app.last_dart,
                 "sim": app.sim is not None,
+                # somebody played in the last minutes -> the auto-updater postpones updates
+                "busy": app.busy,
             }
         )
 
@@ -104,7 +106,11 @@ async def start_webui(app) -> web.AppRunner:
     @routes.post("/api/command")
     async def command(req):
         data = await req.json()
-        await app.command(str(data.get("action", "")))
+        action = str(data.get("action", ""))
+        # the local page has no login – rebooting the Pi is only possible from the web app
+        if action not in ("start", "stop", "reset", "rescan", "restart"):
+            raise web.HTTPForbidden(text="action not allowed locally")
+        await app.command(action)
         return web.json_response({"ok": True})
 
     @routes.get("/api/camera/{index}.jpg")

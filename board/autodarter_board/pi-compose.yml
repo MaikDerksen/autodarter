@@ -1,0 +1,54 @@
+# Autodarter board client for the Raspberry Pi – ready-made images from Docker Hub (no git, no build).
+#
+#   mkdir -p ~/autodarter && cd ~/autodarter
+#   docker run --rm maik05/autodarter-server-board autodarter compose > docker-compose.yml
+#   docker compose up -d
+#   docker exec autodarter-board autodarter server https://<your-server>   # once, is remembered
+#   docker exec autodarter-board autodarter                                # status + pairing code
+#
+# Optional settings in a .env file next to this file, e.g.:
+#   AUTODARTER_SERVER=https://darts.example.com   (alternative to "autodarter server …")
+#   ALLOW_REBOOT=true                              ("Raspberry Pi neu starten" from the app)
+#   COMPOSE_PROFILES=autoupdate                    (pull new versions automatically)
+#   HTTPS_PROXY=http://proxy.firma.local:3128      (company proxy)
+
+services:
+  board:
+    image: ${AUTODARTER_IMAGE:-maik05/autodarter-server-board}:${AUTODARTER_TAG:-latest}
+    container_name: autodarter-board
+    restart: unless-stopped
+    network_mode: host        # status page http://<pi>:3180 in the local network
+    environment:
+      AUTODARTER_SERVER: ${AUTODARTER_SERVER:-}
+      CAMERA_SOURCE: v4l2
+      CAMERAS: ${CAMERAS:-}
+      LOCAL_PORT: ${LOCAL_PORT:-3180}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      ALLOW_REBOOT: ${ALLOW_REBOOT:-false}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
+    volumes:
+      - ./data:/data          # board identity, calibration, settings, server address
+      - /dev:/dev             # USB cameras (hot-plug safe)
+      - /run/udev:/run/udev:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket   # only used with ALLOW_REBOOT=true
+    device_cgroup_rules:
+      - "c 81:* rmw"          # video4linux devices
+
+  # Pulls new versions regularly (and on "Software aktualisieren" in the app), never while somebody plays.
+  updater:
+    profiles: ["autoupdate"]
+    image: ${AUTODARTER_UPDATER_IMAGE:-maik05/autodarter-updater}:${AUTODARTER_TAG:-latest}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-21600}
+      UPDATE_HOURS: ${UPDATE_HOURS:-}
+      UPDATE_BUSY_URL: http://127.0.0.1:${LOCAL_PORT:-3180}/api/status
+      UPDATE_TRIGGER: data/update-request
+      UPDATE_HEARTBEAT: data/.autoupdate-heartbeat
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project

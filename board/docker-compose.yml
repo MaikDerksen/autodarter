@@ -1,13 +1,21 @@
 # Autodarter board client – runs on the Raspberry Pi with the cameras attached.
-# Start:  cp .env.example .env  (set AUTODARTER_SERVER)  &&  docker compose up -d --build
+#
+#   cp .env.example .env            # set AUTODARTER_SERVER (+ AUTODARTER_REGISTRY for ready-made images)
+#   docker compose pull && docker compose up -d     # images from the registry (recommended on the Pi)
+#   docker compose up -d --build                    # … or build on the Pi
+#
+# The Pi only opens an OUTGOING connection to the server – no port forwarding needed on the Pi side.
 # Status page + pairing code: http://<pi-ip>:3180
+# Automatic updates: COMPOSE_PROFILES=autoupdate in .env (then also "Software aktualisieren" in the app).
 
 services:
   board:
+    image: ${AUTODARTER_REGISTRY:-localhost}/autodarter-server-board:${AUTODARTER_TAG:-latest}
     build: .
-    image: autodarter/board:latest
+    # fixed name for the command line:  docker exec autodarter-board autodarter code
+    container_name: autodarter-board
     restart: unless-stopped
-    # host network: reach the server on the LAN and serve the status page on port 3180
+    # host network: status page on port 3180 directly reachable in the local network
     network_mode: host
     environment:
       AUTODARTER_SERVER: ${AUTODARTER_SERVER:-}
@@ -15,9 +23,36 @@ services:
       CAMERAS: ${CAMERAS:-}
       LOCAL_PORT: ${LOCAL_PORT:-3180}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # allow "Pi neu starten" from the web app (uses systemd-logind via the host D-Bus)
+      ALLOW_REBOOT: ${ALLOW_REBOOT:-false}
+      # company networks: outgoing proxy, e.g. http://proxy.firma.local:3128
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-}
     volumes:
       - ./data:/data          # board identity, calibration, settings
       - /dev:/dev             # USB cameras (hot-plug safe)
       - /run/udev:/run/udev:ro
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket   # only used when ALLOW_REBOOT=true
     device_cgroup_rules:
       - "c 81:* rmw"          # video4linux devices
+
+  # Pulls new images regularly (and on "Software aktualisieren" in the app), never while somebody plays.
+  updater:
+    profiles: ["autoupdate"]
+    image: ${AUTODARTER_REGISTRY:-localhost}/autodarter-updater:${AUTODARTER_TAG:-latest}
+    build: ../updater
+    restart: unless-stopped
+    network_mode: host        # reaches the board's status page on localhost
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-21600}
+      UPDATE_HOURS: ${UPDATE_HOURS:-}
+      UPDATE_BUSY_URL: http://127.0.0.1:${LOCAL_PORT:-3180}/api/status
+      UPDATE_TRIGGER: data/update-request
+      UPDATE_HEARTBEAT: data/.autoupdate-heartbeat
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+      # private registry: run "docker login ghcr.io" on the Pi once, the updater uses that login
+      - ${HOME:-/root}/.docker:/root/.docker:ro

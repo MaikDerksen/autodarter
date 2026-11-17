@@ -1,0 +1,6 @@
+# Reverse proxy with automatic HTTPS (Let's Encrypt) for the Autodarter server.
+# Needs: DNS name (e.g. DynDNS) pointing to your home IP + router port forwarding 80 and 443 to this machine.
+{$DOMAIN} {
+	encode zstd gzip
+	reverse_proxy server:3000
+}

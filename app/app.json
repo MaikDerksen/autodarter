@@ -30,7 +30,16 @@
       "themeColor": "#0b0f14",
       "backgroundColor": "#0b0f14"
     },
-    "plugins": ["expo-router"],
+    "plugins": [
+      "expo-router",
+      [
+        "expo-audio",
+        {
+          "microphonePermission": "Autodarter braucht das Mikrofon, um eigene Ansagen aufzunehmen.",
+          "enableBackgroundPlayback": false
+        }
+      ]
+    ],
     "experiments": {
       "typedRoutes": false
     }

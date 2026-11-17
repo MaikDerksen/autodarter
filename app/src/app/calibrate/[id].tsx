@@ -55,6 +55,8 @@ export default function CalibrateScreen() {
         if (c?.points?.length === CALIBRATION_POINTS.length) setPoints(c.points);
       })
       .catch(() => undefined);
+    // initial data load of the screen (loadSnapshot shows its spinner right away)
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     void loadSnapshot();
   }, [id, cam, loadSnapshot]);
 
@@ -143,7 +145,7 @@ export default function CalibrateScreen() {
       <Stack.Screen options={{ title: `Kalibrierung · Kamera ${cam + 1}` }} />
       <Screen maxWidth={1300}>
         <Card>
-          <H2>So geht's</H2>
+          <H2>So geht’s</H2>
           <P muted>
             Ziehe jeden farbigen Punkt exakt auf die äußere Kante des Doppelrings an der jeweiligen Segmentgrenze (z. B. „20 | 1“ = Draht zwischen 20 und 1)
             und den Bull-Punkt in die Mitte des Bullseye. Das grüne Netz zeigt live, wie das Board aus Sicht dieser Kamera erkannt wird – es muss genau auf

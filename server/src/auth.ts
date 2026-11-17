@@ -1,6 +1,7 @@
 import bcrypt from 'bcryptjs';
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
+import { isAdmin } from './admin';
 import { config } from './config';
 import { query } from './db';
 import { HttpError, authenticate, parse, userId } from './http';
@@ -51,7 +52,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
 
   app.get('/api/auth/config', async () => ({ allowRegistration: config.allowRegistration }));
 
-  app.post('/api/auth/register', async (req) => {
+  app.post('/api/auth/register', { config: { rateLimit: { max: 5, timeWindow: '1 minute' } } }, async (req) => {
     if (!config.allowRegistration) throw new HttpError(403, 'Registrierung ist deaktiviert');
     const body = parse(registerBody, req.body);
     const username = body.username.toLowerCase();
@@ -65,7 +66,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
     return { token: sign(u), user: toPublic(u) };
   });
 
-  app.post('/api/auth/login', async (req) => {
+  app.post('/api/auth/login', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req) => {
     const body = parse(credentials, req.body);
     const [u] = await query<UserRow>('SELECT * FROM users WHERE username = $1', [body.username.toLowerCase()]);
     if (!u || !(await bcrypt.compare(body.password, u.password_hash))) {
@@ -77,7 +78,8 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.get('/api/auth/me', { onRequest: authenticate }, async (req) => {
     const u = await getUser(userId(req));
     if (!u) throw new HttpError(401, 'Benutzer existiert nicht mehr');
-    return u;
+    const [extra] = await query<{ voice_pack_id: string | null }>('SELECT voice_pack_id FROM users WHERE id = $1', [u.id]);
+    return { ...u, isAdmin: await isAdmin(u.id), voicePackId: extra?.voice_pack_id ?? null };
   });
 
   app.patch('/api/auth/me', { onRequest: authenticate }, async (req) => {

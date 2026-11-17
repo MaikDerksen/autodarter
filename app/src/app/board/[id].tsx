@@ -1,16 +1,115 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useEffect, useState } from 'react';
-import { Image, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
-import { segmentLabel, type BoardSettings, type BoardSummary, type CameraInfo } from '@shared';
+import { Image, Platform, StyleSheet, Text, useWindowDimensions, View } from 'react-native';
+import { segmentLabel, type BoardMember, type BoardSettings, type BoardSummary, type CameraInfo } from '@shared';
 import { BoardOverlay } from '@/components/BoardOverlay';
 import { Dartboard } from '@/components/Dartboard';
+import { OnlineDot } from '@/components/OnlineDot';
 import { Badge, Button, Card, ErrorText, Field, H2, Loading, P, Row, Screen, Stat } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
+import { useAuth } from '@/lib/auth';
 import { boardBadge } from '@/lib/boardState';
 import { confirm } from '@/lib/confirm';
+import { useFriends } from '@/lib/friends';
 import { useBoardLive, type Frame } from '@/lib/live';
 import { colors, radius } from '@/lib/theme';
+
+/** Who has the board in their account; the owner shares it with friends. */
+function MembersCard({ board, onError }: { board: BoardSummary; onError: (e: string | null) => void }) {
+  const { user } = useAuth();
+  const friends = useFriends();
+  const [members, setMembers] = useState<BoardMember[]>([]);
+  const owner = board.role === 'owner';
+
+  const load = () =>
+    api<BoardMember[]>(`/api/boards/${board.id}/members`)
+      .then(setMembers)
+      .catch((e) => onError(errorMessage(e)));
+  // reload when the member count changes (somebody added the board with the code)
+  useEffect(() => {
+    void load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [board.id, board.memberCount]);
+
+  const act = async (fn: () => Promise<unknown>) => {
+    onError(null);
+    try {
+      await fn();
+      await load();
+    } catch (e) {
+      onError(errorMessage(e));
+    }
+  };
+
+  const memberIds = new Set(members.map((m) => m.userId));
+  const shareable = friends.friends.filter((f) => !memberIds.has(f.id));
+
+  return (
+    <Card>
+      <H2>Spieler mit Zugriff</H2>
+      <P muted>Alle hier können auf dem Board spielen und zuschauen. Läuft ein Spiel, ist das Board für die anderen gesperrt.</P>
+      {members.map((m) => (
+        <View key={m.userId} style={s.memberRow}>
+          <OnlineDot online={m.online} />
+          <Text style={{ color: colors.text, fontWeight: '700', flex: 1 }}>
+            {m.displayName} <Text style={{ color: colors.muted, fontWeight: '400' }}>@{m.username}</Text>
+          </Text>
+          <Badge label={m.role === 'owner' ? 'Besitzer' : 'Spieler'} color={m.role === 'owner' ? colors.accent : colors.muted} />
+          {owner && m.userId !== user?.id ? (
+            <Button
+              small
+              variant="ghost"
+              icon="close"
+              onPress={async () => {
+                if (await confirm('Zugriff entfernen?', `${m.displayName} kann das Board danach nicht mehr nutzen.`, 'Entfernen')) {
+                  await act(() => api(`/api/boards/${board.id}/members/${m.userId}`, { method: 'DELETE' }));
+                }
+              }}
+            />
+          ) : null}
+        </View>
+      ))}
+      {owner && shareable.length > 0 ? (
+        <>
+          <Text style={{ color: colors.muted, fontWeight: '700' }}>Mit Freunden teilen</Text>
+          <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
+            {shareable.map((f) => (
+              <Button
+                key={f.id}
+                small
+                variant="secondary"
+                icon="share-social"
+                title={f.displayName}
+                onPress={() => act(() => api(`/api/boards/${board.id}/members`, { body: { userId: f.id } }))}
+              />
+            ))}
+          </View>
+        </>
+      ) : null}
+      {board.pairingCode ? (
+        <View style={s.codeBox}>
+          <View style={{ flex: 1, gap: 4 }}>
+            <Text style={{ color: colors.muted, fontSize: 12, fontWeight: '700' }}>CODE FÜR WEITERE SPIELER</Text>
+            <Text selectable style={s.code}>
+              {board.pairingCode}
+            </Text>
+            <Text style={{ color: colors.faint, fontSize: 12 }}>Unter „Boards → Board hinzufügen“ eingeben. Gilt nur einmal.</Text>
+          </View>
+          {owner ? (
+            <Button
+              small
+              variant="ghost"
+              icon="refresh"
+              title="Neuer Code"
+              onPress={() => act(() => api(`/api/boards/${board.id}/pairing-code`, { body: {} }))}
+            />
+          ) : null}
+        </View>
+      ) : null}
+    </Card>
+  );
+}
 
 function CameraTile({
   cam,
@@ -74,7 +173,8 @@ export default function BoardScreen() {
   const [name, setName] = useState('');
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
-  const [settings, setSettings] = useState<Record<string, string>>({});
+  /** edited values of the detection settings (null = unchanged, show the board's values) */
+  const [edited, setSettings] = useState<Record<string, string> | null>(null);
   const live = useBoardLive(id, { stream: true });
   const board = live.board ?? initial;
 
@@ -87,14 +187,12 @@ export default function BoardScreen() {
       .catch((e) => setError(errorMessage(e)));
   }, [id]);
 
-  useEffect(() => {
-    if (board?.settings && Object.keys(settings).length === 0) {
-      const s: Record<string, string> = {};
-      for (const f of SETTING_FIELDS) s[f.key] = String(board.settings[f.key]);
-      s.resolution = board.settings.resolution.join('x');
-      setSettings(s);
-    }
-  }, [board?.settings, settings]);
+  const fromBoard: Record<string, string> = {};
+  if (board?.settings) {
+    for (const f of SETTING_FIELDS) fromBoard[f.key] = String(board.settings[f.key]);
+    fromBoard.resolution = board.settings.resolution.join('x');
+  }
+  const settings = edited ?? fromBoard;
 
   const run = async (key: string, fn: () => Promise<unknown>) => {
     setBusy(key);
@@ -119,6 +217,7 @@ export default function BoardScreen() {
   const badge = boardBadge(board);
   const command = (action: string) => run(action, () => api(`/api/boards/${id}/command`, { body: { action } }));
   const dart = live.lastDart;
+  const owner = board.role === 'owner';
 
   const saveSettings = () =>
     run('settings', async () => {
@@ -164,10 +263,95 @@ export default function BoardScreen() {
             <Button small variant="secondary" icon="stop" title="Stopp" onPress={() => command('stop')} loading={busy === 'stop'} disabled={!board.online} />
             <Button small variant="secondary" icon="refresh" title="Reset" onPress={() => command('reset')} loading={busy === 'reset'} disabled={!board.online} />
             <Button small variant="secondary" icon="search" title="Kameras neu suchen" onPress={() => command('rescan')} loading={busy === 'rescan'} disabled={!board.online} />
-            {board.activeMatchId ? (
-              <Button small variant="secondary" icon="game-controller" title="Aktives Spiel" onPress={() => router.push(`/match/${board.activeMatchId}`)} />
-            ) : null}
           </Row>
+          {board.activeMatch ? (
+            <Row wrap style={s.activeRow}>
+              <Ionicons name="game-controller" size={18} color={colors.warning} />
+              <Text style={{ color: colors.text, flex: 1 }}>
+                Läuft gerade: <Text style={{ fontWeight: '800' }}>{board.activeMatch.title}</Text> · {board.activeMatch.players.join(' vs. ')} (von{' '}
+                {board.activeMatch.ownerName})
+              </Text>
+              <Button small variant="secondary" icon="eye" title="Öffnen" onPress={() => router.push(`/match/${board.activeMatch!.id}`)} />
+              <Button
+                small
+                variant="danger"
+                icon="stop-circle"
+                title="Spiel beenden"
+                loading={busy === 'endMatch'}
+                onPress={async () => {
+                  const a = board.activeMatch!;
+                  if (
+                    await confirm(
+                      'Laufendes Spiel beenden?',
+                      `${a.title} von ${a.ownerName} (${a.players.join(' vs. ')}) wird abgebrochen und das Board ist wieder frei.`,
+                      'Spiel beenden',
+                    )
+                  ) {
+                    await run('endMatch', () => api(`/api/matches/${a.id}/abort`, { body: {} }));
+                  }
+                }}
+              />
+            </Row>
+          ) : null}
+          <Row wrap>
+            <Button
+              small
+              variant="secondary"
+              icon="reload"
+              title="Board-Client neu starten"
+              loading={busy === 'restart'}
+              disabled={!board.online}
+              onPress={async () => {
+                if (await confirm('Board-Client neu starten?', 'Die Software auf dem Pi startet neu und ist nach ca. 10–20 Sekunden wieder online.', 'Neu starten')) {
+                  await command('restart');
+                }
+              }}
+            />
+            <Button
+              small
+              variant="secondary"
+              icon="cloud-download"
+              title="Software aktualisieren"
+              loading={busy === 'update'}
+              disabled={!owner || !board.online || !board.status?.capabilities?.update}
+              onPress={async () => {
+                if (
+                  await confirm(
+                    'Board-Software aktualisieren?',
+                    'Der Pi lädt die neueste Version aus der Registry. Gibt es eine neue, startet der Board-Client kurz neu.',
+                    'Aktualisieren',
+                  )
+                ) {
+                  await command('update');
+                }
+              }}
+            />
+            <Button
+              small
+              variant="danger"
+              icon="power"
+              title="Raspberry Pi neu starten"
+              loading={busy === 'reboot'}
+              disabled={!owner || !board.online || !board.status?.capabilities?.reboot}
+              onPress={async () => {
+                if (await confirm('Raspberry Pi neu starten?', 'Der komplette Pi bootet neu. Das Board ist danach ca. 1–2 Minuten offline.', 'Pi neu starten')) {
+                  await command('reboot');
+                }
+              }}
+            />
+          </Row>
+          {!owner ? (
+            <P muted>Update, Pi-Neustart, Einstellungen und Name ändert nur der Besitzer des Boards.</P>
+          ) : board.online ? (
+            <>
+              {!board.status?.capabilities?.reboot ? (
+                <P muted>Pi-Neustart ist nicht freigegeben: in board/.env ALLOW_REBOOT=true setzen und den Board-Client neu starten.</P>
+              ) : null}
+              {!board.status?.capabilities?.update ? (
+                <P muted>Auto-Update ist auf dem Pi nicht aktiv: in board/.env COMPOSE_PROFILES=autoupdate setzen.</P>
+              ) : null}
+            </>
+          ) : null}
           <ErrorText>{error}</ErrorText>
         </Card>
 
@@ -222,7 +406,7 @@ export default function BoardScreen() {
               <Field
                 label="Auflösung"
                 value={settings.resolution ?? ''}
-                onChangeText={(t) => setSettings((s) => ({ ...s, resolution: t }))}
+                onChangeText={(t) => setSettings({ ...settings, resolution: t })}
                 placeholder="1280x720"
               />
             </View>
@@ -231,15 +415,17 @@ export default function BoardScreen() {
                 <Field
                   label={f.label}
                   value={settings[f.key] ?? ''}
-                  onChangeText={(t) => setSettings((s) => ({ ...s, [f.key]: t }))}
+                  onChangeText={(t) => setSettings({ ...settings, [f.key]: t })}
                   keyboardType="numeric"
                 />
                 <Text style={{ color: colors.faint, fontSize: 12, marginTop: 4 }}>{f.hint}</Text>
               </View>
             ))}
           </View>
-          <Button title="Einstellungen speichern" icon="save" onPress={saveSettings} loading={busy === 'settings'} disabled={!board.online} />
+          <Button title="Einstellungen speichern" icon="save" onPress={saveSettings} loading={busy === 'settings'} disabled={!owner || !board.online} />
         </Card>
+
+        <MembersCard board={board} onError={setError} />
 
         <Card>
           <H2>Verwaltung</H2>
@@ -250,6 +436,7 @@ export default function BoardScreen() {
             <Button
               title="Umbenennen"
               variant="secondary"
+              disabled={!owner}
               onPress={() =>
                 run('rename', async () => {
                   const b = await api<BoardSummary>(`/api/boards/${id}`, { method: 'PATCH', body: { name } });
@@ -260,11 +447,17 @@ export default function BoardScreen() {
             />
           </Row>
           <Button
-            title="Board von meinem Konto entfernen"
+            title="Board aus meinem Konto entfernen"
             variant="danger"
             icon="unlink"
             onPress={async () => {
-              if (await confirm('Board entfernen?', 'Der Pi bekommt einen neuen Kopplungscode und kann neu verbunden werden.', 'Entfernen')) {
+              const text =
+                owner && board.memberCount > 1
+                  ? 'Die anderen Spieler behalten das Board, der am längsten dabei ist wird Besitzer.'
+                  : owner
+                    ? 'Du bist der Letzte mit diesem Board – es kann danach mit dem Code neu hinzugefügt werden.'
+                    : 'Du kannst es später mit dem Code wieder hinzufügen.';
+              if (await confirm('Board entfernen?', text, 'Entfernen')) {
                 await run('remove', () => api(`/api/boards/${id}`, { method: 'DELETE' }));
                 router.replace('/boards');
               }
@@ -279,4 +472,23 @@ export default function BoardScreen() {
 const s = StyleSheet.create({
   camBox: { backgroundColor: '#000', borderRadius: radius.md, overflow: 'hidden', borderWidth: 1, borderColor: colors.border },
   camPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8 },
+  activeRow: { backgroundColor: '#2a1f05', borderRadius: radius.md, padding: 10, borderWidth: 1, borderColor: colors.warning + '66' },
+  memberRow: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 10, borderRadius: radius.md, backgroundColor: colors.bg },
+  codeBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    padding: 12,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    backgroundColor: colors.bg,
+  },
+  code: {
+    color: colors.accent,
+    fontSize: 28,
+    fontWeight: '900',
+    letterSpacing: 6,
+    fontFamily: Platform.select({ ios: 'Menlo', default: 'monospace' }),
+  },
 });

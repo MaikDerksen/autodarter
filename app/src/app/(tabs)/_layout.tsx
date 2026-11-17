@@ -26,6 +26,10 @@ export default function TabsLayout() {
         options={{ title: 'Boards', tabBarIcon: ({ color, size }) => <Ionicons name="videocam" color={color as string} size={size} /> }}
       />
       <Tabs.Screen
+        name="friends"
+        options={{ title: 'Freunde', tabBarIcon: ({ color, size }) => <Ionicons name="people" color={color as string} size={size} /> }}
+      />
+      <Tabs.Screen
         name="stats"
         options={{ title: 'Statistik', tabBarIcon: ({ color, size }) => <Ionicons name="stats-chart" color={color as string} size={size} /> }}
       />

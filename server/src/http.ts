@@ -3,9 +3,12 @@ import type { z } from 'zod';
 
 export class HttpError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  /** Extra fields sent along with { error } (e.g. { code: 'board_busy', ... }). */
+  data?: Record<string, unknown>;
+  constructor(status: number, message: string, data?: Record<string, unknown>) {
     super(message);
     this.status = status;
+    this.data = data;
   }
 }
 

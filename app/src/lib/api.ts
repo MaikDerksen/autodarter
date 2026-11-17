@@ -4,9 +4,12 @@ let onUnauthorized: (() => void) | null = null;
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /** The full error body (e.g. { error, code: 'board_busy', activeMatch, canForce }). */
+  data: Record<string, unknown>;
+  constructor(message: string, status: number, data: Record<string, unknown> = {}) {
     super(message);
     this.status = status;
+    this.data = data;
   }
 }
 
@@ -43,7 +46,8 @@ export async function api<T = unknown>(path: string, opts: { method?: string; bo
   const json = await res.json().catch(() => null);
   if (!res.ok) {
     if (res.status === 401 && token) onUnauthorized?.();
-    throw new ApiError((json as { error?: string } | null)?.error ?? `Fehler ${res.status}`, res.status);
+    const body = (json ?? {}) as Record<string, unknown>;
+    throw new ApiError(typeof body.error === 'string' ? body.error : `Fehler ${res.status}`, res.status, body);
   }
   return json as T;
 }

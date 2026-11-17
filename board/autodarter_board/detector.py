@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 import uuid
 from dataclasses import dataclass
 
@@ -106,6 +107,10 @@ class Detector:
         self._pre_takeout: tuple[str, int] | None = None
         self._lock = threading.RLock()
         self.last_areas: dict[int, int] = {}
+        # lighting: mean brightness per camera, "settling" until, and whether the board is too dark
+        self._means: dict[int, np.ndarray] = {}
+        self._light_until = 0.0
+        self.dark = False
 
     # ------------------------------------------------------------------ control
     def set_calibration(self, index: int, points: list[tuple[float, float]] | None) -> None:
@@ -167,6 +172,20 @@ class Detector:
                 self.cams[idx].prev = g
             return events
 
+        if self._lighting(grays):
+            # light switched on/off or the cameras are still adjusting their exposure: no hand, no dart –
+            # just follow the image. The calibration is not affected, the board did not move.
+            for idx, g in grays.items():
+                cam = self.cams[idx]
+                cam.ref = cam.prev = g
+            self.moving = False
+            self.calm = 0
+            if self.state == "takeout_in_progress" and self._pre_takeout:
+                self.state, self.darts = self._pre_takeout
+                self._pre_takeout = None
+                events.append(("state",))
+            return events
+
         thr = s.diffThreshold
         motion_px = max(15, s.minDartArea // 2)
         moving_now = False
@@ -197,6 +216,33 @@ class Detector:
         self.calm = 0
         self._evaluate(grays, events)
         return events
+
+    def _lighting(self, grays: dict[int, np.ndarray]) -> bool:
+        """True while the light changes (switched on/off, auto exposure settling) or it is too dark to see darts."""
+        now = time.monotonic()
+        # brightness of a 3x3 grid per camera
+        means = {idx: cv2.resize(g, (3, 3), interpolation=cv2.INTER_AREA).astype(np.float32).ravel() for idx, g in grays.items()}
+
+        def light_jump(idx: int, cur: np.ndarray) -> bool:
+            prev = self._means.get(idx)
+            if prev is None:
+                return False
+            rel = (cur - prev) / np.maximum(prev, 8.0)
+            # a hand covers a part of the image – a light switch changes (almost) the whole image the same way
+            return int(np.sum(rel > 0.15)) >= 7 or int(np.sum(rel < -0.15)) >= 7
+
+        jumps = [light_jump(i, m) for i, m in means.items()]
+        known = all(i in self._means for i in means)
+        self._means = means
+        if known and jumps and all(jumps):
+            if now >= self._light_until:
+                log.info("Lichtwechsel erkannt – Erkennung pausiert kurz")
+            self._light_until = now + 3.0
+        dark = all(float(m.max()) < 18 for m in means.values())
+        if dark != self.dark:
+            self.dark = dark
+            log.info("Board ist zu dunkel – Erkennung wartet auf Licht" if dark else "Licht ist wieder da")
+        return dark or now < self._light_until
 
     # ------------------------------------------------------------------ evaluation
     def _diff_mask(self, idx: int, g: np.ndarray, ref: np.ndarray) -> np.ndarray:

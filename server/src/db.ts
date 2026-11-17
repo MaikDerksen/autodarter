@@ -1,7 +1,8 @@
 import pg from 'pg';
 import { config } from './config';
 
-export const pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10 });
+// connectionTimeoutMillis: never hang forever if the database is not reachable (pg default is no timeout)
+export const pool = new pg.Pool({ connectionString: config.databaseUrl, max: 10, connectionTimeoutMillis: 5000 });
 
 export async function query<T = Record<string, unknown>>(text: string, params: unknown[] = []): Promise<T[]> {
   const res = await pool.query(text, params);
@@ -50,6 +51,52 @@ const MIGRATIONS: string[] = [
   );
   CREATE INDEX match_players_user_idx ON match_players(user_id);
   `,
+  // v2: boards can be shared (n users <-> m boards) and friends
+  `
+  CREATE TABLE board_members (
+    board_id TEXT NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    role TEXT NOT NULL DEFAULT 'member',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (board_id, user_id)
+  );
+  CREATE INDEX board_members_user_idx ON board_members(user_id);
+  INSERT INTO board_members(board_id, user_id, role) SELECT id, owner_id, 'owner' FROM boards WHERE owner_id IS NOT NULL;
+
+  CREATE TABLE friendships (
+    requester_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    addressee_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (requester_id, addressee_id),
+    CHECK (requester_id <> addressee_id)
+  );
+  CREATE INDEX friendships_addressee_idx ON friendships(addressee_id);
+  `,
+  `
+  -- last known calibration per camera id: survives a lost data folder on the Pi
+  ALTER TABLE boards ADD COLUMN calibration_backup JSONB NOT NULL DEFAULT '{}';
+
+  CREATE TABLE voice_packs (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    shared BOOLEAN NOT NULL DEFAULT true,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX voice_packs_owner_idx ON voice_packs(owner_id);
+  CREATE TABLE voice_clips (
+    pack_id UUID NOT NULL REFERENCES voice_packs(id) ON DELETE CASCADE,
+    key TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    data BYTEA NOT NULL,
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (pack_id, key)
+  );
+  ALTER TABLE users ADD COLUMN voice_pack_id UUID REFERENCES voice_packs(id) ON DELETE SET NULL;
+  ALTER TABLE matches ADD COLUMN voice_pack_id UUID REFERENCES voice_packs(id) ON DELETE SET NULL;
+  `,
 ];
 
 async function waitForDb(): Promise<void> {
@@ -58,8 +105,9 @@ async function waitForDb(): Promise<void> {
       await pool.query('SELECT 1');
       return;
     } catch (err) {
+      // give up after ~3 minutes – Docker (restart: unless-stopped) starts the server again
       if (attempt >= 30) throw err;
-      console.log(`[db] Datenbank noch nicht erreichbar (Versuch ${attempt}) …`);
+      console.log(`[db] Datenbank noch nicht erreichbar (Versuch ${attempt}): ${(err as Error).message}`);
       await new Promise((r) => setTimeout(r, 2000));
     }
   }

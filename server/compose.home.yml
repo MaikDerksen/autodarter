@@ -1,0 +1,84 @@
+# Autodarter server for the home server – ready-made images from Docker Hub (no git, no build).
+#
+#   mkdir -p ~/autodarter-server && cd ~/autodarter-server
+#   docker run --rm maik05/autodarter-server cat /app/compose.yml > docker-compose.yml
+#   printf 'JWT_SECRET=%s\nPOSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 32)" "$(openssl rand -hex 16)" > .env
+#   docker compose up -d                  # → http://<server-ip>:3000 in the home network
+#
+# Reachable from the internet (Pi in the office, phones on the go) – free, with your static IP:
+#   1. free name for the IP, e.g. https://www.duckdns.org → meindart.duckdns.org = <static IP>
+#   2. router at home: forward TCP 80 and 443 to this machine
+#   3. echo 'DOMAIN=meindart.duckdns.org' >> .env
+#      echo 'COMPOSE_PROFILES=https,autoupdate' >> .env
+#      docker compose up -d               # → https://meindart.duckdns.org (Let's Encrypt certificate)
+
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: autodarter
+      POSTGRES_USER: autodarter
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-autodarter}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U autodarter -d autodarter"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  server:
+    image: ${AUTODARTER_IMAGE:-maik05/autodarter-server}:${AUTODARTER_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://autodarter:${POSTGRES_PASSWORD:-autodarter}@db:5432/autodarter
+      JWT_SECRET: ${JWT_SECRET:?Bitte JWT_SECRET in .env setzen}
+      # after creating the accounts of your group: ALLOW_REGISTRATION=false in .env
+      ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      STREAM_FPS: ${STREAM_FPS:-4}
+      STREAM_MAX_WIDTH: ${STREAM_MAX_WIDTH:-640}
+      BOARD_IDLE_MINUTES: ${BOARD_IDLE_MINUTES:-30}
+      STALE_MATCH_HOURS: ${STALE_MATCH_HOURS:-12}
+      # who may update the server from the app (usernames, comma separated) – empty = the first account
+      ADMIN_USERS: ${ADMIN_USERS:-}
+    ports:
+      - "${PORT:-3000}:3000"   # home network (plain HTTP); from the internet only via caddy
+
+  # HTTPS with a free Let's Encrypt certificate for DOMAIN (ports 80 + 443 forwarded in the router)
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - server
+    command: caddy reverse-proxy --from ${DOMAIN:-missing-DOMAIN-in-env} --to server:3000
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # Pulls new versions regularly, never while somebody is playing.
+  updater:
+    profiles: ["autoupdate"]
+    image: ${AUTODARTER_UPDATER_IMAGE:-maik05/autodarter-updater}:${AUTODARTER_TAG:-latest}
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-21600}
+      UPDATE_HOURS: ${UPDATE_HOURS:-3-6}
+      UPDATE_BUSY_URL: http://server:3000/api/health
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+
+volumes:
+  pgdata:
+  caddy-data:
+  caddy-config:

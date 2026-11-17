@@ -9,6 +9,10 @@ export interface User {
   username: string;
   displayName: string;
   createdAt: string;
+  /** may update the server from the app */
+  isAdmin?: boolean;
+  /** voice pack used for the matches I create */
+  voicePackId?: string | null;
 }
 
 interface AuthState {

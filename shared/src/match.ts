@@ -22,12 +22,30 @@ export interface CricketSettings {
   maxRounds: number;
 }
 
-export type MatchSettings = X01Settings | CricketSettings;
+/** Which fields of the target number count in Around the Clock. */
+export type AtcHits = 'any' | 'double' | 'triple';
+
+export interface AroundTheClockSettings {
+  mode: 'atc';
+  /** any = single/double/triple of the number, double / triple = only that ring */
+  hits: AtcHits;
+  /** a double / triple jumps 2 / 3 numbers ahead (only with hits 'any') */
+  skip: boolean;
+  /** after the 20 the bull has to be hit */
+  bull: boolean;
+  legs: number;
+}
+
+export type MatchSettings = X01Settings | CricketSettings | AroundTheClockSettings;
+export type GameMode = MatchSettings['mode'];
 
 export interface PlayerInfo {
   id: string;
   name: string;
   userId?: string | null;
+  /** Remote play: this player throws at their own board (default: the board of the match). */
+  boardId?: string | null;
+  boardName?: string | null;
 }
 
 export type DartSource = 'board' | 'manual';
@@ -56,14 +74,16 @@ export interface DartView {
   y?: number;
   src: DartSource;
   eventIndex: number;
+  /** Around the Clock: the dart hit the target number. */
+  hit?: boolean;
 }
 
 export interface TurnView {
   player: number;
   darts: DartView[];
-  /** x01: points scored (0 on bust). cricket: points gained by this player. */
+  /** x01: points scored (0 on bust). cricket: points gained by this player. atc: numbers advanced. */
   points: number;
-  /** cricket: marks that counted. */
+  /** cricket: marks that counted. atc: hits. */
   marks: number;
   bust: boolean;
   checkout: boolean;
@@ -99,6 +119,9 @@ export interface PlayerStats {
   bestLegDarts: number | null;
   marks: number;
   mpr: number;
+  /** Around the Clock: darts that hit the target number. */
+  hits: number;
+  hitRate: number;
 }
 
 export interface CricketView {
@@ -106,6 +129,13 @@ export interface CricketView {
   /** marks[player][targetIndex] (can exceed 3 only visually capped by client) */
   marks: number[][];
   points: number[];
+}
+
+export interface AtcView {
+  /** 1..20 (and 25 for the bull) */
+  targets: number[];
+  /** progress[player] = index of the next target in targets (targets.length = finished) */
+  progress: number[];
 }
 
 export interface MatchState {
@@ -121,6 +151,7 @@ export interface MatchState {
   legFinished: boolean;
   remaining: number[];
   cricket: CricketView | null;
+  atc: AtcView | null;
   checkout: string[] | null;
   finished: boolean;
   winner: number | null;
@@ -150,6 +181,8 @@ export function emptyStats(): PlayerStats {
     bestLegDarts: null,
     marks: 0,
     mpr: 0,
+    hits: 0,
+    hitRate: 0,
   };
 }
 
@@ -160,6 +193,7 @@ export function finalizeStats(s: PlayerStats): PlayerStats {
   s.first9Average = s.first9Darts ? r2((s.first9Points / s.first9Darts) * 3) : 0;
   s.checkoutRate = s.dartsAtDouble ? r2((s.checkouts / s.dartsAtDouble) * 100) : 0;
   s.mpr = s.dartsThrown ? r2((s.marks / s.dartsThrown) * 3) : 0;
+  s.hitRate = s.dartsThrown ? r2((s.hits / s.dartsThrown) * 100) : 0;
   return s;
 }
 
@@ -183,6 +217,7 @@ export function mergeStats(list: PlayerStats[]): PlayerStats {
       out.bestLegDarts = out.bestLegDarts === null ? s.bestLegDarts : Math.min(out.bestLegDarts, s.bestLegDarts);
     }
     out.marks += s.marks;
+    out.hits += s.hits ?? 0;
   }
   return finalizeStats(out);
 }
@@ -214,6 +249,11 @@ export function validateSettings(settings: MatchSettings, playerCount: number): 
     }
     return null;
   }
+  if (settings.mode === 'atc') {
+    if (!['any', 'double', 'triple'].includes(settings.hits)) return 'Ungültige Around-the-Clock-Variante.';
+    if (typeof settings.skip !== 'boolean' || typeof settings.bull !== 'boolean') return 'Ungültige Around-the-Clock-Optionen.';
+    return null;
+  }
   return 'Unbekannter Spielmodus.';
 }
 
@@ -235,6 +275,7 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
   let remaining: number[] = [];
   let opened: boolean[] = [];
   let cricket: CricketView | null = null;
+  let atc: AtcView | null = null;
   let currentPlayer = 0;
   let turn!: TurnView;
   let turnStart: TurnStart = { remaining: 0, opened: false };
@@ -267,9 +308,18 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
       remaining = players.map(() => settings.startScore);
       opened = players.map(() => settings.inMode === 'straight');
       cricket = null;
+      atc = null;
+    } else if (settings.mode === 'atc') {
+      remaining = players.map(() => 0);
+      opened = players.map(() => true);
+      cricket = null;
+      const targets = Array.from({ length: 20 }, (_, i) => i + 1);
+      if (settings.bull) targets.push(25);
+      atc = { targets, progress: players.map(() => 0) };
     } else {
       remaining = players.map(() => 0);
       opened = players.map(() => true);
+      atc = null;
       cricket = {
         targets: CRICKET_TARGETS,
         marks: players.map(() => CRICKET_TARGETS.map(() => 0)),
@@ -305,6 +355,8 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
         s.checkouts++;
         s.highestCheckout = Math.max(s.highestCheckout, turn.points);
       }
+    } else if (settings.mode === 'atc') {
+      s.hits += turn.marks;
     } else {
       s.marks += turn.marks;
     }
@@ -405,6 +457,31 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
     return gained;
   };
 
+  /** Returns how many numbers the player advanced (0 = no hit). */
+  const applyAtcDart = (seg: Segment): number => {
+    if (settings.mode !== 'atc' || !atc) return 0;
+    const p = currentPlayer;
+    const idx = atc.progress[p];
+    const target = atc.targets[idx];
+    if (target === undefined || seg.multiplier === 0 || seg.number !== target) return 0;
+    if (target === 25) {
+      // bull: outer bull counts as single, bullseye as double (there is no triple bull)
+      if (settings.hits !== 'any' && seg.multiplier !== 2) return 0;
+    } else if (settings.hits === 'double' && seg.multiplier !== 2) return 0;
+    else if (settings.hits === 'triple' && seg.multiplier !== 3) return 0;
+    const step = settings.skip && settings.hits === 'any' && target !== 25 ? seg.multiplier : 1;
+    let next = idx + step;
+    const last = atc.targets.length - 1;
+    // jumps never skip the bull: past the 20 you land on the bull
+    if (settings.bull && idx < last && next > last) next = last;
+    next = Math.min(next, atc.targets.length);
+    atc.progress[p] = next;
+    turn.marks += 1;
+    turn.points += next - idx;
+    if (next >= atc.targets.length) winLeg(p);
+    return next - idx;
+  };
+
   const cricketRoundLimitWinner = (): number => {
     const c = cricket!;
     const totalMarks = c.marks.map((m) => m.reduce((a, b) => a + Math.min(b, 3), 0));
@@ -425,16 +502,13 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
     if (finished) return;
     if (ev.t === 'dart') {
       if (turn.complete) return;
-      const pts = settings.mode === 'x01' ? applyX01Dart(ev.seg) : applyCricketDart(ev.seg);
-      turn.darts.push({
-        seg: ev.seg,
-        label: segmentLabel(ev.seg),
-        points: settings.mode === 'x01' ? pts : segmentScore(ev.seg),
-        x: ev.x,
-        y: ev.y,
-        src: ev.src,
-        eventIndex: idx,
-      });
+      // the dart belongs to the turn before it is scored, so a leg-winning dart is counted (darts, average, best leg)
+      const view: DartView = { seg: ev.seg, label: segmentLabel(ev.seg), points: 0, x: ev.x, y: ev.y, src: ev.src, eventIndex: idx };
+      turn.darts.push(view);
+      const pts =
+        settings.mode === 'x01' ? applyX01Dart(ev.seg) : settings.mode === 'atc' ? applyAtcDart(ev.seg) : applyCricketDart(ev.seg);
+      view.points = settings.mode === 'cricket' ? segmentScore(ev.seg) : pts;
+      if (settings.mode === 'atc') view.hit = pts > 0;
       if (turn.darts.length >= 3) turn.complete = true;
       return;
     }
@@ -482,6 +556,7 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
     legFinished,
     remaining,
     cricket,
+    atc,
     checkout,
     finished,
     winner,
@@ -502,10 +577,17 @@ export function undoEvents(events: MatchEvent[]): MatchEvent[] {
   return out;
 }
 
-export function defaultSettings(mode: 'x01' | 'cricket'): MatchSettings {
-  return mode === 'x01'
-    ? { mode: 'x01', startScore: 301, inMode: 'straight', outMode: 'double', legs: 1 }
-    : { mode: 'cricket', variant: 'standard', legs: 1, maxRounds: 20 };
+export function defaultSettings(mode: GameMode): MatchSettings {
+  if (mode === 'x01') return { mode: 'x01', startScore: 301, inMode: 'straight', outMode: 'double', legs: 1 };
+  if (mode === 'atc') return { mode: 'atc', hits: 'any', skip: false, bull: true, legs: 1 };
+  return { mode: 'cricket', variant: 'standard', legs: 1, maxRounds: 20 };
+}
+
+/** The number a player has to hit next in Around the Clock (null = finished / other mode). */
+export function atcTarget(state: MatchState, player: number): number | null {
+  const a = state.atc;
+  if (!a) return null;
+  return a.targets[a.progress[player]] ?? null;
 }
 
 export function describeSettings(s: MatchSettings): string {
@@ -513,6 +595,10 @@ export function describeSettings(s: MatchSettings): string {
   if (s.mode === 'x01') {
     const io = (m: InOutMode) => (m === 'straight' ? 'S' : m === 'double' ? 'D' : 'M');
     return `${s.startScore} ${io(s.inMode)}I/${io(s.outMode)}O${legs}`;
+  }
+  if (s.mode === 'atc') {
+    const hits = s.hits === 'double' ? ' · Doubles' : s.hits === 'triple' ? ' · Triples' : '';
+    return `Around the Clock${hits}${s.skip && s.hits === 'any' ? ' · Sprünge' : ''}${s.bull ? ' · mit Bull' : ''}${legs}`;
   }
   return `Cricket ${s.variant === 'cutthroat' ? 'Cut-Throat' : 'Standard'}${s.maxRounds ? ` · ${s.maxRounds} Runden` : ''}${legs}`;
 }

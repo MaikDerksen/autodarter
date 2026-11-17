@@ -18,8 +18,10 @@ log = logging.getLogger(__name__)
 @dataclass
 class CameraDesc:
     device: str
-    cam_id: str  # stable id (USB port path) used to store the calibration
+    cam_id: str  # stable id (USB port) used to store the calibration
     name: str
+    # other ids the same camera may have been stored under (udev link name, device name)
+    aliases: tuple[str, ...] = ()
 
 
 def _read(path: str, default: str = "") -> str:
@@ -33,7 +35,7 @@ def _read(path: str, default: str = "") -> str:
 def discover(explicit: list[str] | None = None) -> list[CameraDesc]:
     """Find USB capture devices. Ignores the Pi's internal codec/ISP nodes and metadata nodes."""
     if explicit:
-        return [CameraDesc(dev, _stable_id(dev), os.path.basename(dev)) for dev in explicit]
+        return [_desc(dev, os.path.basename(dev)) for dev in explicit]
     found: list[CameraDesc] = []
     nodes = sorted(glob.glob("/sys/class/video4linux/video*"), key=lambda p: int(re.sub(r"\D", "", p) or 0))
     for node in nodes:
@@ -43,18 +45,46 @@ def discover(explicit: list[str] | None = None) -> list[CameraDesc]:
         if "/usb" not in devpath:
             continue  # rpi-hevc-dec, pispbe, … are not cameras
         dev = "/dev/" + os.path.basename(node)
-        found.append(CameraDesc(dev, _stable_id(dev), _read(os.path.join(node, "name"), dev)))
+        found.append(_desc(dev, _read(os.path.join(node, "name"), dev)))
     # stable order = USB port order, so camera numbers don't change between reboots
     found.sort(key=lambda c: c.cam_id)
     return found
 
 
-def _stable_id(dev: str) -> str:
+def _desc(dev: str, name: str) -> CameraDesc:
+    port = _port_id(dev)
+    link = _udev_id(dev)
+    base = os.path.basename(os.path.realpath(dev))
+    primary = port or link or base
+    aliases = tuple(dict.fromkeys(a for a in (link, base) if a and a != primary))
+    return CameraDesc(dev, primary, name, aliases)
+
+
+def _port_id(dev: str) -> str | None:
+    """Id of the USB port the camera is plugged into, read from sysfs.
+
+    Same format as udev's /dev/v4l/by-path names (e.g. "platform-xhci-hcd.0-usb-0:1:1.0"), but it does not
+    depend on udev having created the links yet – right after boot the container may start before udev.
+    """
+    node = os.path.join("/sys/class/video4linux", os.path.basename(os.path.realpath(dev)))
+    parts = os.path.realpath(os.path.join(node, "device")).split("/")
+    iface = parts[-1]  # e.g. "1-1.2:1.0" = bus 1, port 1.2, config 1, interface 0
+    if ":" not in iface or "-" not in iface:
+        return None
+    bus = next((i for i, part in enumerate(parts) if re.fullmatch(r"usb\d+", part)), None)
+    if bus is None or bus == 0:
+        return None
+    controller = parts[bus - 1]
+    port = iface.split("-", 1)[1]
+    return f"platform-{controller}-usb-0:{port}"
+
+
+def _udev_id(dev: str) -> str | None:
     real = os.path.realpath(dev)
     for link in glob.glob("/dev/v4l/by-path/*"):
         if os.path.realpath(link) == real and "video-index0" in link:
             return os.path.basename(link).replace("-video-index0", "")
-    return os.path.basename(dev)
+    return None
 
 
 class CameraStream(threading.Thread):
@@ -65,6 +95,7 @@ class CameraStream(threading.Thread):
         self.index = index
         self.device = desc.device
         self.cam_id = desc.cam_id
+        self.aliases = desc.aliases
         self.name = desc.name
         self.req = (width, height, fps)
         self.width, self.height = width, height

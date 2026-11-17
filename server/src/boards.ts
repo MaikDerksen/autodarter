@@ -5,6 +5,9 @@ import type { WebSocket } from 'ws';
 import { z } from 'zod';
 import { CALIBRATION_POINTS } from '@shared/board';
 import type {
+  BoardActiveMatch,
+  BoardMember,
+  BoardRole,
   BoardSettings,
   BoardStatus,
   BoardSummary,
@@ -13,17 +16,22 @@ import type {
   DetectedDart,
   ServerToBoard,
 } from '@shared/protocol';
+import { config } from './config';
 import { query } from './db';
+import { areFriends } from './friends';
 import { HttpError, authenticate, parse, userId } from './http';
-import { publishBoard, streamViewerCount } from './hub';
+import { isUserOnline, publishBoard, publishFrame, revokeBoard, streamDemand } from './hub';
 
 interface BoardRow {
   id: string;
+  /** The board's owner (admin). All users with access – owner included – are in board_members. */
   owner_id: string | null;
   name: string;
   secret_hash: string;
   pairing_code: string | null;
   calibration: Record<string, CameraCalibration | null>;
+  /** last known calibration per camera id (never shrinks when the Pi forgets one) */
+  calibration_backup: Record<string, CameraCalibration>;
   settings: BoardSettings | null;
   last_seen: Date | null;
 }
@@ -36,7 +44,8 @@ interface LiveBoard {
   status: BoardStatus | null;
   calibration: Record<string, CameraCalibration | null>;
   settings: BoardSettings | null;
-  streaming: boolean;
+  /** Last stream request sent to the board (JSON), to avoid resending. */
+  streamKey: string;
   pending: Map<string, (msg: Extract<BoardToServer, { type: 'snapshot' }>) => void>;
 }
 
@@ -45,9 +54,9 @@ const live = new Map<string, LiveBoard>();
 /** Emits 'dart' (boardId, dart), 'takeout_started' (boardId), 'takeout_finished' (boardId). */
 export const boardEvents = new EventEmitter();
 
-/** Resolves the active match of a board (set by the match module to avoid an import cycle). */
-let activeMatchLookup: (boardId: string) => string | null = () => null;
-export function setActiveMatchLookup(fn: (boardId: string) => string | null) {
+/** Resolves the running match of a board (set by the match module to avoid an import cycle). */
+let activeMatchLookup: (boardId: string) => BoardActiveMatch | null = () => null;
+export function setActiveMatchLookup(fn: (boardId: string) => BoardActiveMatch | null) {
   activeMatchLookup = fn;
 }
 
@@ -59,8 +68,10 @@ function pairingCode(): string {
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 
-function summary(row: BoardRow): BoardSummary {
+async function baseSummary(row: BoardRow): Promise<Omit<BoardSummary, 'role'>> {
   const l = live.get(row.id);
+  const [count] = await query<{ n: number }>('SELECT count(*)::int AS n FROM board_members WHERE board_id = $1', [row.id]);
+  const active = activeMatchLookup(row.id);
   return {
     id: row.id,
     name: row.name,
@@ -68,9 +79,21 @@ function summary(row: BoardRow): BoardSummary {
     status: l?.status ?? null,
     calibration: l?.calibration ?? row.calibration ?? {},
     settings: l?.settings ?? row.settings ?? null,
-    activeMatchId: activeMatchLookup(row.id),
+    activeMatchId: active?.id ?? null,
+    activeMatch: active,
     lastSeen: row.last_seen ? row.last_seen.toISOString() : null,
+    pairingCode: row.pairing_code,
+    memberCount: count?.n ?? 0,
   };
+}
+
+/** Guests (players of a remote match) only see the status, not the pairing code. */
+function withRole(base: Omit<BoardSummary, 'role'>, role: BoardRole): BoardSummary {
+  return { ...base, role, pairingCode: role === 'guest' ? null : base.pairingCode };
+}
+
+async function summary(row: BoardRow, role: BoardRole): Promise<BoardSummary> {
+  return withRole(await baseSummary(row), role);
 }
 
 async function getRow(id: string): Promise<BoardRow | null> {
@@ -78,15 +101,23 @@ async function getRow(id: string): Promise<BoardRow | null> {
   return row ?? null;
 }
 
-export async function getOwnedBoard(id: string, owner: string): Promise<BoardRow> {
-  const row = await getRow(id);
-  if (!row || row.owner_id !== owner) throw new HttpError(404, 'Board nicht gefunden');
-  return row;
+/** Role of a user on a board, null = no access. */
+export async function canAccessBoard(id: string, user: string): Promise<BoardRole | null> {
+  const [r] = await query<{ role: BoardRole }>('SELECT role FROM board_members WHERE board_id = $1 AND user_id = $2', [id, user]);
+  return r?.role ?? null;
 }
 
-export async function canAccessBoard(id: string, owner: string): Promise<boolean> {
-  const row = await getRow(id);
-  return !!row && row.owner_id === owner;
+async function requireMember(id: string, user: string): Promise<{ row: BoardRow; role: BoardRole }> {
+  const role = await canAccessBoard(id, user);
+  const row = role ? await getRow(id) : null;
+  if (!row || !role) throw new HttpError(404, 'Board nicht gefunden');
+  return { row, role };
+}
+
+async function requireOwner(id: string, user: string): Promise<BoardRow> {
+  const { row, role } = await requireMember(id, user);
+  if (role !== 'owner') throw new HttpError(403, 'Das darf nur der Besitzer des Boards');
+  return row;
 }
 
 export function sendToBoard(id: string, msg: ServerToBoard): boolean {
@@ -102,23 +133,51 @@ export function isBoardOnline(id: string): boolean {
 
 export async function publishBoardStatus(id: string): Promise<void> {
   const row = await getRow(id);
-  if (row) publishBoard(id, { type: 'board_status', board: summary(row) });
+  if (!row) return;
+  const base = await baseSummary(row);
+  publishBoard(id, (c) => ({ type: 'board_status', board: withRole(base, c.boardRoles.get(id) ?? 'member') }));
 }
 
-export async function currentBoardSummary(id: string): Promise<BoardSummary | null> {
+export async function currentBoardSummary(id: string, role: BoardRole): Promise<BoardSummary | null> {
   const row = await getRow(id);
-  return row ? summary(row) : null;
+  return row ? summary(row, role) : null;
 }
 
-/** Turn the camera stream of a board on/off depending on the number of viewers. */
+/** Tell the board which camera images are currently watched (raw and/or frontal view). */
 export function refreshStream(id: string): void {
   const l = live.get(id);
   if (!l) return;
-  const want = streamViewerCount(id) > 0;
-  if (want !== l.streaming) {
-    l.streaming = want;
-    sendToBoard(id, { type: 'stream', enabled: want, fps: 4, maxWidth: 640 });
+  const d = streamDemand(id);
+  const key = JSON.stringify(d);
+  if (key === l.streamKey) return;
+  l.streamKey = key;
+  sendToBoard(id, {
+    type: 'stream',
+    enabled: d.raw || d.front.length > 0,
+    fps: config.streamFps,
+    maxWidth: config.streamMaxWidth,
+    raw: d.raw,
+    front: d.front,
+  });
+}
+
+function welcome(row: BoardRow) {
+  sendToBoard(row.id, {
+    type: 'welcome',
+    claimed: !!row.owner_id,
+    pairingCode: row.pairing_code,
+    name: row.owner_id ? row.name : null,
+    calibrationBackup: row.calibration_backup ?? {},
+  });
+}
+
+/** Calibrations the board reports (with camera id) – kept as backup on the server. */
+function backupEntries(cal: Record<string, CameraCalibration | null> | undefined): Record<string, CameraCalibration> {
+  const out: Record<string, CameraCalibration> = {};
+  for (const c of Object.values(cal ?? {})) {
+    if (c?.camId && Array.isArray(c.points) && c.points.length === 5) out[c.camId] = { points: c.points, camId: c.camId };
   }
+  return out;
 }
 
 function requestSnapshot(id: string, camera: number): Promise<Extract<BoardToServer, { type: 'snapshot' }>> {
@@ -158,11 +217,13 @@ export function handleBoardSocket(socket: WebSocket, log: FastifyInstance['log']
     if (!board) socket.close(4001, 'hello expected');
   }, 10000);
 
-  socket.on('message', async (raw) => {
-    alive = true;
+  // Messages of one board are processed strictly in order: right after a reconnect the board
+  // sends its hello followed by buffered darts, which must not overtake the (async) hello.
+  let chain: Promise<void> = Promise.resolve();
+  const handle = async (raw: unknown) => {
     let msg: BoardToServer;
     try {
-      msg = JSON.parse(raw.toString());
+      msg = JSON.parse(String(raw));
     } catch {
       return;
     }
@@ -177,6 +238,10 @@ export function handleBoardSocket(socket: WebSocket, log: FastifyInstance['log']
     } catch (err) {
       log.error({ err }, 'board message failed');
     }
+  };
+  socket.on('message', (raw) => {
+    alive = true;
+    chain = chain.then(() => handle(raw));
   });
 
   socket.on('close', async () => {
@@ -219,12 +284,11 @@ async function onHello(
       socket.close(4003, 'secret mismatch');
       return null;
     }
-    if (!row.owner_id && !row.pairing_code) {
-      [row] = await query<BoardRow>('UPDATE boards SET pairing_code = $2 WHERE id = $1 RETURNING *', [row.id, pairingCode()]);
-    }
     [row] = await query<BoardRow>(
-      'UPDATE boards SET calibration = $2, settings = $3, last_seen = now() WHERE id = $1 RETURNING *',
-      [row.id, JSON.stringify(msg.calibration ?? {}), JSON.stringify(msg.settings ?? null)],
+      `UPDATE boards SET calibration = $2, settings = $3, last_seen = now(), pairing_code = COALESCE(pairing_code, $4),
+              calibration_backup = calibration_backup || $5::jsonb
+       WHERE id = $1 RETURNING *`,
+      [row.id, JSON.stringify(msg.calibration ?? {}), JSON.stringify(msg.settings ?? null), pairingCode(), JSON.stringify(backupEntries(msg.calibration))],
     );
   }
 
@@ -239,14 +303,14 @@ async function onHello(
     status: msg.status ?? null,
     calibration: msg.calibration ?? {},
     settings: msg.settings ?? null,
-    streaming: false,
+    streamKey: '',
     pending: new Map(),
   };
   live.set(row.id, board);
   log.info({ board: row.id, claimed: !!row.owner_id }, 'board connected');
-  sendToBoard(row.id, { type: 'welcome', claimed: !!row.owner_id, pairingCode: row.owner_id ? null : row.pairing_code, name: row.name });
+  welcome(row);
   refreshStream(row.id);
-  publishBoard(row.id, { type: 'board_status', board: summary(row) });
+  await publishBoardStatus(row.id);
   return board;
 }
 
@@ -258,7 +322,11 @@ async function onBoardMessage(board: LiveBoard, msg: BoardToServer): Promise<voi
       break;
     case 'calibration':
       board.calibration = msg.calibration ?? {};
-      await query('UPDATE boards SET calibration = $2 WHERE id = $1', [board.id, JSON.stringify(board.calibration)]);
+      await query('UPDATE boards SET calibration = $2, calibration_backup = calibration_backup || $3::jsonb WHERE id = $1', [
+        board.id,
+        JSON.stringify(board.calibration),
+        JSON.stringify(backupEntries(board.calibration)),
+      ]);
       await publishBoardStatus(board.id);
       break;
     case 'settings':
@@ -277,19 +345,38 @@ async function onBoardMessage(board: LiveBoard, msg: BoardToServer): Promise<voi
       publishBoard(board.id, { type: 'board_event', boardId: board.id, event: msg.type });
       boardEvents.emit(msg.type, board.id);
       break;
-    case 'frame':
-      publishBoard(
-        board.id,
-        { type: 'board_frame', boardId: board.id, camera: msg.camera, data: msg.data, width: msg.width, height: msg.height },
-        true,
-      );
+    case 'frame': {
+      const view = msg.view === 'front' ? 'front' : 'raw';
+      publishFrame(board.id, view, msg.camera, {
+        type: 'board_frame',
+        boardId: board.id,
+        camera: msg.camera,
+        data: msg.data,
+        width: msg.width,
+        height: msg.height,
+        view,
+      });
       break;
+    }
     case 'snapshot':
       board.pending.get(msg.requestId)?.(msg);
       break;
     case 'pong':
       break;
   }
+}
+
+/** Keep the in-memory board and the Pi in sync after ownership / pairing changes. */
+async function afterMembershipChange(id: string): Promise<void> {
+  const row = await getRow(id);
+  if (!row) return;
+  const l = live.get(id);
+  if (l) {
+    l.ownerId = row.owner_id;
+    l.name = row.name;
+  }
+  welcome(row);
+  await publishBoardStatus(id);
 }
 
 const calibrationBody = z.object({
@@ -309,19 +396,32 @@ const settingsBody = z
   })
   .partial();
 
+/** Commands every member may send; the rest only the owner. */
+const MEMBER_COMMANDS = new Set(['start', 'stop', 'reset', 'rescan', 'restart']);
+
 export async function boardRoutes(app: FastifyInstance): Promise<void> {
   app.addHook('onRequest', authenticate);
 
   app.get('/api/boards', async (req) => {
-    const rows = await query<BoardRow>('SELECT * FROM boards WHERE owner_id = $1 ORDER BY created_at', [userId(req)]);
-    return rows.map(summary);
+    const rows = await query<BoardRow & { role: BoardRole }>(
+      `SELECT b.*, m.role FROM boards b JOIN board_members m ON m.board_id = b.id
+       WHERE m.user_id = $1 ORDER BY m.created_at`,
+      [userId(req)],
+    );
+    return Promise.all(rows.map((r) => summary(r, r.role)));
   });
 
   app.get<{ Params: { id: string } }>('/api/boards/:id', async (req) => {
-    return summary(await getOwnedBoard(req.params.id, userId(req)));
+    const { row, role } = await requireMember(req.params.id, userId(req));
+    return summary(row, role);
   });
 
-  app.post('/api/boards/claim', async (req) => {
+  /**
+   * Add a board to the own account with its pairing code. The first user becomes the owner,
+   * everybody after that a member. The code changes after every use.
+   */
+  app.post('/api/boards/claim', { config: { rateLimit: { max: 10, timeWindow: '1 minute' } } }, async (req) => {
+    const user = userId(req);
     const body = parse(
       z.object({
         code: z.string().trim().toUpperCase().min(4).max(12),
@@ -330,59 +430,142 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
       req.body,
     );
     const code = body.code.replace(/[^A-Z0-9]/g, '');
+    const [found] = await query<BoardRow>('SELECT * FROM boards WHERE pairing_code = $1', [code]);
+    if (!found) throw new HttpError(404, 'Kein Board mit diesem Code gefunden. Ist der Pi online?');
+    const existing = await canAccessBoard(found.id, user);
+    if (existing) return summary(found, existing);
+
     const [row] = await query<BoardRow>(
-      `UPDATE boards SET owner_id = $2, pairing_code = NULL, name = COALESCE($3, name)
-       WHERE pairing_code = $1 AND owner_id IS NULL RETURNING *`,
-      [code, userId(req), body.name ?? null],
+      `UPDATE boards SET pairing_code = $3,
+         name = CASE WHEN owner_id IS NULL THEN COALESCE($4, name) ELSE name END,
+         owner_id = COALESCE(owner_id, $2)
+       WHERE id = $1 AND pairing_code = $5 RETURNING *`,
+      [found.id, user, pairingCode(), body.name ?? null, code],
     );
-    if (!row) throw new HttpError(404, 'Kein Board mit diesem Code gefunden. Ist der Pi online?');
-    const l = live.get(row.id);
-    if (l) {
-      l.ownerId = row.owner_id;
-      l.name = row.name;
-    }
-    sendToBoard(row.id, { type: 'welcome', claimed: true, pairingCode: null, name: row.name });
-    return summary(row);
+    if (!row) throw new HttpError(409, 'Der Code wurde gerade verwendet – bitte den neuen Code eingeben');
+    const role: BoardRole = row.owner_id === user ? 'owner' : 'member';
+    await query('INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING', [row.id, user, role]);
+    req.log.info({ board: row.id, user, role }, 'board added to account');
+    await afterMembershipChange(row.id);
+    return summary(row, role);
   });
 
   app.patch<{ Params: { id: string } }>('/api/boards/:id', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
+    await requireOwner(req.params.id, userId(req));
     const body = parse(z.object({ name: z.string().trim().min(1).max(40) }), req.body);
     const [row] = await query<BoardRow>('UPDATE boards SET name = $2 WHERE id = $1 RETURNING *', [req.params.id, body.name]);
-    const l = live.get(row.id);
-    if (l) l.name = row.name;
-    await publishBoardStatus(row.id);
-    return summary(row);
+    await afterMembershipChange(row.id);
+    return summary(row, 'owner');
   });
 
+  /** Remove the board from the own account. If the owner leaves, the longest member takes over. */
   app.delete<{ Params: { id: string } }>('/api/boards/:id', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
-    const code = pairingCode();
-    await query('UPDATE boards SET owner_id = NULL, pairing_code = $2 WHERE id = $1', [req.params.id, code]);
-    const l = live.get(req.params.id);
-    if (l) l.ownerId = null;
-    sendToBoard(req.params.id, { type: 'welcome', claimed: false, pairingCode: code, name: null });
+    const user = userId(req);
+    const { role } = await requireMember(req.params.id, user);
+    await query('DELETE FROM board_members WHERE board_id = $1 AND user_id = $2', [req.params.id, user]);
+    if (role === 'owner') {
+      const [next] = await query<{ user_id: string }>(
+        'SELECT user_id FROM board_members WHERE board_id = $1 ORDER BY created_at LIMIT 1',
+        [req.params.id],
+      );
+      if (next) {
+        await query(`UPDATE board_members SET role = 'owner' WHERE board_id = $1 AND user_id = $2`, [req.params.id, next.user_id]);
+        await query('UPDATE boards SET owner_id = $2 WHERE id = $1', [req.params.id, next.user_id]);
+      } else {
+        await query('UPDATE boards SET owner_id = NULL, pairing_code = $2 WHERE id = $1', [req.params.id, pairingCode()]);
+      }
+    }
+    revokeBoard(user, req.params.id);
+    refreshStream(req.params.id);
+    await afterMembershipChange(req.params.id);
     return { ok: true };
   });
 
+  app.get<{ Params: { id: string } }>('/api/boards/:id/members', async (req) => {
+    await requireMember(req.params.id, userId(req));
+    const rows = await query<{ user_id: string; username: string; display_name: string; role: BoardRole }>(
+      `SELECT m.user_id, u.username, u.display_name, m.role FROM board_members m JOIN users u ON u.id = m.user_id
+       WHERE m.board_id = $1 ORDER BY (m.role = 'owner') DESC, m.created_at`,
+      [req.params.id],
+    );
+    return rows.map(
+      (r): BoardMember => ({
+        userId: r.user_id,
+        username: r.username,
+        displayName: r.display_name,
+        role: r.role,
+        online: isUserOnline(r.user_id),
+      }),
+    );
+  });
+
+  /** Share the board with a friend. */
+  app.post<{ Params: { id: string } }>('/api/boards/:id/members', async (req) => {
+    const user = userId(req);
+    await requireOwner(req.params.id, user);
+    const body = parse(z.object({ userId: z.string().uuid() }), req.body);
+    if (!(await areFriends(user, body.userId))) throw new HttpError(403, 'Boards kannst du nur mit Freunden teilen');
+    await query(`INSERT INTO board_members(board_id, user_id, role) VALUES ($1, $2, 'member') ON CONFLICT DO NOTHING`, [
+      req.params.id,
+      body.userId,
+    ]);
+    await publishBoardStatus(req.params.id);
+    return { ok: true };
+  });
+
+  app.delete<{ Params: { id: string; userId: string } }>('/api/boards/:id/members/:userId', async (req) => {
+    const user = userId(req);
+    await requireOwner(req.params.id, user);
+    if (req.params.userId === user) throw new HttpError(400, 'Zum Verlassen „Board entfernen“ verwenden');
+    await query('DELETE FROM board_members WHERE board_id = $1 AND user_id = $2', [req.params.id, req.params.userId]);
+    revokeBoard(req.params.userId, req.params.id);
+    refreshStream(req.params.id);
+    await publishBoardStatus(req.params.id);
+    return { ok: true };
+  });
+
+  /** New pairing code (e.g. if the old one was passed on too widely). */
+  app.post<{ Params: { id: string } }>('/api/boards/:id/pairing-code', async (req) => {
+    await requireOwner(req.params.id, userId(req));
+    const [row] = await query<BoardRow>('UPDATE boards SET pairing_code = $2 WHERE id = $1 RETURNING *', [req.params.id, pairingCode()]);
+    await afterMembershipChange(row.id);
+    return { pairingCode: row.pairing_code };
+  });
+
   app.post<{ Params: { id: string } }>('/api/boards/:id/command', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
-    const body = parse(z.object({ action: z.enum(['start', 'stop', 'reset', 'rescan']) }), req.body);
+    const user = userId(req);
+    const { role } = await requireMember(req.params.id, user);
+    const body = parse(z.object({ action: z.enum(['start', 'stop', 'reset', 'rescan', 'restart', 'reboot', 'update']) }), req.body);
+    if (!MEMBER_COMMANDS.has(body.action) && role !== 'owner') throw new HttpError(403, 'Das darf nur der Besitzer des Boards');
+    const l = live.get(req.params.id);
+    if (!l) throw new HttpError(409, 'Board ist offline');
+    if (body.action === 'reboot' && !l.status?.capabilities?.reboot) {
+      throw new HttpError(409, 'Pi-Neustart ist auf diesem Board nicht freigegeben (ALLOW_REBOOT=true in board/.env setzen).');
+    }
+    if (body.action === 'update' && !l.status?.capabilities?.update) {
+      throw new HttpError(409, 'Auto-Update ist auf dem Pi nicht aktiv (COMPOSE_PROFILES=autoupdate in board/.env setzen).');
+    }
     if (!sendToBoard(req.params.id, { type: 'command', action: body.action })) throw new HttpError(409, 'Board ist offline');
+    req.log.info({ board: req.params.id, action: body.action, user }, 'board command');
     return { ok: true };
   });
 
   app.get<{ Params: { id: string; cam: string } }>('/api/boards/:id/cameras/:cam/snapshot', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
+    await requireMember(req.params.id, userId(req));
     const snap = await requestSnapshot(req.params.id, Number(req.params.cam));
     if (!snap.data) throw new HttpError(404, 'Kamera liefert kein Bild');
     return { data: snap.data, width: snap.width, height: snap.height };
   });
 
   app.put<{ Params: { id: string; cam: string } }>('/api/boards/:id/cameras/:cam/calibration', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
+    await requireMember(req.params.id, userId(req));
     const camera = Number(req.params.cam);
     const body = req.body === null ? null : parse(calibrationBody, req.body);
+    if (body === null) {
+      // deliberately reset: the backup of that camera goes too
+      const camId = live.get(req.params.id)?.status?.cameras.find((c) => c.index === camera)?.id;
+      if (camId) await query('UPDATE boards SET calibration_backup = calibration_backup - $2 WHERE id = $1', [req.params.id, camId]);
+    }
     if (!sendToBoard(req.params.id, { type: 'set_calibration', camera, calibration: body })) {
       throw new HttpError(409, 'Board ist offline');
     }
@@ -390,7 +573,7 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.put<{ Params: { id: string } }>('/api/boards/:id/settings', async (req) => {
-    await getOwnedBoard(req.params.id, userId(req));
+    await requireOwner(req.params.id, userId(req));
     const body = parse(settingsBody, req.body);
     if (!sendToBoard(req.params.id, { type: 'set_settings', settings: body })) throw new HttpError(409, 'Board ist offline');
     return { ok: true };

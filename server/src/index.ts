@@ -2,22 +2,34 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import cors from '@fastify/cors';
 import jwt from '@fastify/jwt';
+import rateLimit from '@fastify/rate-limit';
 import fastifyStatic from '@fastify/static';
 import websocket from '@fastify/websocket';
 import Fastify from 'fastify';
+import { adminRoutes, updaterPoll } from './admin';
 import { authRoutes } from './auth';
 import { boardRoutes, cleanupBoards, handleBoardSocket } from './boards';
 import { handleClientSocket } from './clientSocket';
 import { config } from './config';
 import { migrate, pool } from './db';
+import { friendRoutes } from './friends';
 import { HttpError } from './http';
-import { matchRoutes, restoreActiveMatches } from './matches';
+import { cleanupStaleMatches, matchRoutes, restoreActiveMatches, serverBusy } from './matches';
 import { statsRoutes } from './stats';
+import { voicePublicRoutes, voiceRoutes } from './voice';
 
 const app = Fastify({ logger: { level: config.logLevel }, bodyLimit: 2 * 1024 * 1024, trustProxy: true });
 
-await app.register(cors, { origin: true });
+await app.register(cors, { origin: true, methods: ['GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'] });
 await app.register(jwt, { secret: config.jwtSecret });
+// Only routes with an explicit rateLimit config are limited (login, register, claim, board connect).
+await app.register(rateLimit, {
+  global: false,
+  errorResponseBuilder: (_req, ctx) =>
+    Object.assign(new Error(`Zu viele Versuche – bitte in ${Math.ceil(ctx.ttl / 1000)} s erneut probieren`), {
+      statusCode: 429,
+    }),
+});
 await app.register(websocket, { options: { maxPayload: 16 * 1024 * 1024 } });
 
 // Accept empty JSON bodies (e.g. POST /undo without payload).
@@ -33,23 +45,32 @@ app.addContentTypeParser('application/json', { parseAs: 'string' }, (_req, body,
 });
 
 app.setErrorHandler((err: Error & { statusCode?: number }, req, reply) => {
-  if (err instanceof HttpError) return reply.code(err.status).send({ error: err.message });
+  if (err instanceof HttpError) return reply.code(err.status).send({ error: err.message, ...err.data });
   if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
   req.log.error({ err }, 'request failed');
   return reply.code(500).send({ error: 'Interner Serverfehler' });
 });
 
-app.get('/api/health', async () => {
+// busy = somebody played in the last minutes -> the auto-updater postpones the update
+// updater=1: the auto-update container asks; "update": true = somebody pressed "Server aktualisieren"
+app.get<{ Querystring: { updater?: string } }>('/api/health', async (req) => {
   await pool.query('SELECT 1');
-  return { ok: true };
+  const update = req.query.updater === '1' ? updaterPoll() : false;
+  return { ok: true, version: config.version, busy: serverBusy(), ...(update ? { update: true } : {}) };
 });
 
 await app.register(authRoutes);
 await app.register(boardRoutes);
 await app.register(matchRoutes);
 await app.register(statsRoutes);
+await app.register(friendRoutes);
+await app.register(adminRoutes);
+await app.register(voiceRoutes);
+await app.register(voicePublicRoutes);
 
-app.get('/ws/board', { websocket: true }, (socket) => handleBoardSocket(socket, app.log));
+app.get('/ws/board', { websocket: true, config: { rateLimit: { max: 30, timeWindow: '1 minute' } } }, (socket) =>
+  handleBoardSocket(socket, app.log),
+);
 app.get<{ Querystring: { token?: string } }>('/ws', { websocket: true }, (socket, req) =>
   handleClientSocket(app, socket, req.query.token),
 );
@@ -75,6 +96,12 @@ app.setNotFoundHandler((req, reply) => {
 
 await migrate();
 await restoreActiveMatches();
+const staleCheck = () =>
+  cleanupStaleMatches()
+    .then((n) => n && app.log.info(`${n} verwaiste Spiele automatisch beendet`))
+    .catch((err) => app.log.error({ err }, 'stale match cleanup failed'));
+await staleCheck();
+setInterval(staleCheck, 10 * 60 * 1000).unref();
 await cleanupBoards().catch(() => undefined);
 setInterval(() => cleanupBoards().catch(() => undefined), 24 * 3600 * 1000).unref();
 

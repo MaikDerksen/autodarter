@@ -36,6 +36,53 @@ export function X01Scoreboard({ state, compact }: { state: MatchState; compact?:
   );
 }
 
+/** Around the Clock: next number per player and the progress over 1..20 (+ bull). */
+export function AtcScoreboard({ state, compact }: { state: MatchState; compact?: boolean }) {
+  const a = state.atc;
+  if (!a) return null;
+  return (
+    <View style={styles.players}>
+      {state.players.map((p, i) => {
+        const active = i === state.currentPlayer && !state.finished;
+        const done = a.progress[i] >= a.targets.length;
+        const target = a.targets[a.progress[i]];
+        const s = state.stats[i];
+        return (
+          <View key={p.id} style={[styles.player, active && styles.playerActive, compact && { minWidth: 140 }]}>
+            <View style={styles.playerHead}>
+              <Text style={[styles.name, active && { color: colors.text }]} numberOfLines={1}>
+                {p.name}
+              </Text>
+              {state.settings.legs > 1 ? <Text style={styles.legs}>{state.legsWon[i]} Legs</Text> : null}
+            </View>
+            <Text style={[styles.remaining, compact && { fontSize: 48 }, active && { color: colors.text }]}>
+              {done ? '✓' : target === 25 ? 'Bull' : target}
+            </Text>
+            <View style={styles.track} accessibilityLabel={`${a.progress[i]} von ${a.targets.length} geschafft`}>
+              {a.targets.map((t, ti) => (
+                <View
+                  key={t}
+                  style={[
+                    styles.trackCell,
+                    ti < a.progress[i] && { backgroundColor: colors.accent },
+                    ti === a.progress[i] && { backgroundColor: active ? colors.warning : colors.faint },
+                  ]}
+                />
+              ))}
+            </View>
+            <View style={styles.playerFoot}>
+              <Text style={styles.meta}>
+                {a.progress[i]}/{a.targets.length}
+              </Text>
+              <Text style={styles.meta}>Quote {s.hitRate.toFixed(0)} %</Text>
+            </View>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
 function Marks({ n }: { n: number }) {
   if (n <= 0) return <Text style={styles.markEmpty}>·</Text>;
   if (n === 1) return <Text style={styles.mark}>/</Text>;
@@ -43,7 +90,7 @@ function Marks({ n }: { n: number }) {
   return <Text style={[styles.mark, { color: colors.accent }]}>⊗</Text>;
 }
 
-export function CricketScoreboard({ state }: { state: MatchState }) {
+export function CricketScoreboard({ state, compact }: { state: MatchState; compact?: boolean }) {
   const c = state.cricket;
   if (!c) return null;
   return (
@@ -51,7 +98,7 @@ export function CricketScoreboard({ state }: { state: MatchState }) {
       <View style={styles.cRow}>
         <Text style={[styles.cTarget, { color: colors.muted }]} />
         {state.players.map((p, i) => (
-          <View key={p.id} style={[styles.cCell, i === state.currentPlayer && !state.finished && styles.cActive]}>
+          <View key={p.id} style={[styles.cCell, styles.cHead, compact && styles.cHeadCompact, i === state.currentPlayer && !state.finished && styles.cActive]}>
             <Text style={styles.cName} numberOfLines={1}>
               {p.name}
             </Text>
@@ -66,7 +113,7 @@ export function CricketScoreboard({ state }: { state: MatchState }) {
           <View key={t} style={[styles.cRow, closedAll && { opacity: 0.35 }]}>
             <Text style={styles.cTarget}>{t === 25 ? 'B' : t}</Text>
             {state.players.map((p, i) => (
-              <View key={p.id} style={[styles.cCell, i === state.currentPlayer && !state.finished && styles.cActive]}>
+              <View key={p.id} style={[styles.cCell, compact && styles.cCellCompact, i === state.currentPlayer && !state.finished && styles.cActive]}>
                 <Marks n={c.marks[i][ti]} />
               </View>
             ))}
@@ -105,13 +152,18 @@ const styles = StyleSheet.create({
   remaining: { color: colors.muted, fontSize: 64, fontWeight: '900', letterSpacing: -2, fontVariant: ['tabular-nums'] },
   playerFoot: { flexDirection: 'row', justifyContent: 'space-between' },
   meta: { color: colors.muted, fontSize: 13, fontWeight: '600' },
+  track: { flexDirection: 'row', gap: 2, marginVertical: 6 },
+  trackCell: { flex: 1, height: 6, borderRadius: 3, backgroundColor: colors.border },
   cricket: { backgroundColor: colors.surface, borderRadius: radius.lg, borderWidth: 1, borderColor: colors.border, overflow: 'hidden' },
   cRow: { flexDirection: 'row', alignItems: 'stretch', borderBottomWidth: 1, borderBottomColor: colors.border },
   cTarget: { width: 56, textAlign: 'center', alignSelf: 'center', color: colors.text, fontSize: 22, fontWeight: '900' },
-  cCell: { flex: 1, alignItems: 'center', justifyContent: 'center', paddingVertical: 8, gap: 2 },
+  cCell: { flex: 1, alignItems: 'center', justifyContent: 'center', height: 46 },
+  cHead: { height: 78, gap: 2 },
+  cHeadCompact: { height: 66 },
+  cCellCompact: { height: 36 },
   cActive: { backgroundColor: '#0f2418' },
   cName: { color: colors.text, fontWeight: '700', fontSize: 14 },
   cPoints: { color: colors.text, fontSize: 30, fontWeight: '900' },
-  mark: { color: colors.text, fontSize: 26, fontWeight: '800' },
-  markEmpty: { color: colors.faint, fontSize: 22 },
+  mark: { color: colors.text, fontSize: 26, fontWeight: '800', lineHeight: 32 },
+  markEmpty: { color: colors.faint, fontSize: 22, lineHeight: 32 },
 });

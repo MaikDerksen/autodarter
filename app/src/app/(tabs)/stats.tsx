@@ -1,91 +1,130 @@
 import Ionicons from '@expo/vector-icons/Ionicons';
 import { router } from 'expo-router';
-import { Pressable, Text, View } from 'react-native';
-import type { PlayerStats } from '@shared';
-import { Badge, Card, ErrorText, H2, Loading, P, Screen, Stat } from '@/components/ui';
-import { useFocusFetch } from '@/lib/hooks';
-import { colors, radius } from '@/lib/theme';
+import { useMemo, useState } from 'react';
+import { Pressable, ScrollView, Text, View, useWindowDimensions } from 'react-native';
+import { Legend, SERIES_COLORS, type SeriesInfo } from '@/components/charts';
+import { Chip, kit } from '@/components/StatsKit';
+import {
+  AtcSection,
+  CricketSection,
+  HeadToHeadSection,
+  HeatSection,
+  OverviewSection,
+  RecentSection,
+  X01Section,
+  type StatsCtx,
+} from '@/components/StatsSections';
+import { Button, Card, ErrorText, Loading, Screen, Segmented } from '@/components/ui';
+import { useFriends } from '@/lib/friends';
+import { statsPath, useStats, type StatsRange } from '@/lib/stats';
+import { colors } from '@/lib/theme';
 
-interface StatsResponse {
-  matches: number;
-  wins: number;
-  x01: PlayerStats & { matches: number };
-  cricket: PlayerStats & { matches: number };
-  recent: {
-    id: string;
-    title: string;
-    mode: 'x01' | 'cricket';
-    won: boolean;
-    opponents: string[];
-    average: number;
-    mpr: number;
-    finishedAt: string;
-  }[];
-}
+const RANGES: { value: StatsRange; label: string }[] = [
+  { value: '7d', label: '7 T' },
+  { value: '30d', label: '30 T' },
+  { value: '90d', label: '90 T' },
+  { value: 'all', label: 'Alle' },
+];
 
 export default function StatsScreen() {
-  const { data, error, loading } = useFocusFetch<StatsResponse>('/api/stats/me');
-  if (loading && !data) return <Loading />;
-  if (error && !data) return <Screen><ErrorText>{error}</ErrorText></Screen>;
-  if (!data) return null;
-  const x = data.x01;
-  const c = data.cricket;
-  const winRate = data.matches ? Math.round((data.wins / data.matches) * 100) : 0;
+  const { width } = useWindowDimensions();
+  const wide = width >= 900;
+  const [range, setRange] = useState<StatsRange>('all');
+  const [friendId, setFriendId] = useState<string | null>(null);
+  const friends = useFriends();
+  const activeFriend = friends.friends.find((f) => f.id === friendId) ?? null;
+
+  const mine = useStats(statsPath('me', range));
+  const theirs = useStats(activeFriend ? statsPath(activeFriend.id, range) : null);
+
+  const friendData = activeFriend && theirs.data?.user.id === activeFriend.id ? theirs.data : null;
+  const friendIds = useMemo(() => new Set(friends.friends.map((f) => f.id)), [friends.friends]);
+
+  if (!mine.data) {
+    if (mine.error) {
+      return (
+        <Screen>
+          <ErrorText>{mine.error}</ErrorText>
+          <Button title="Erneut versuchen" variant="secondary" icon="refresh" onPress={() => void mine.reload()} />
+        </Screen>
+      );
+    }
+    return <Loading label="Statistik wird berechnet …" />;
+  }
+
+  const series: SeriesInfo[] = [
+    { key: 'me', label: 'Du', color: SERIES_COLORS.me },
+    ...(friendData ? [{ key: 'friend', label: friendData.user.displayName, color: SERIES_COLORS.friend }] : []),
+  ];
+  const ctx: StatsCtx = { me: mine.data, friend: friendData, series, wide };
+  const empty = mine.data.overview.matches === 0 && (!friendData || friendData.overview.matches === 0);
+  const pending = mine.pending || (!!activeFriend && theirs.pending);
+
   return (
-    <Screen>
-      <Card>
-        <H2>Übersicht</H2>
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-          <Stat label="Spiele" value={data.matches} />
-          <Stat label="Siege" value={data.wins} />
-          <Stat label="Siegquote" value={`${winRate} %`} />
-        </View>
-        {data.matches === 0 ? <P muted>Spiele ein Match als „du“, um hier Statistiken zu sehen.</P> : null}
-      </Card>
-      <Card>
-        <H2>X01 · {x.matches} Spiele</H2>
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-          <Stat label="3-Dart-Average" value={x.average.toFixed(2)} />
-          <Stat label="First-9-Average" value={x.first9Average.toFixed(2)} />
-          <Stat label="Checkout-Quote" value={`${x.checkoutRate.toFixed(1)} %`} sub={`${x.checkouts} / ${x.dartsAtDouble}`} />
-          <Stat label="Höchster Checkout" value={x.highestCheckout || '–'} />
-          <Stat label="Höchste Aufnahme" value={x.highestTurn || '–'} />
-          <Stat label="180er" value={x.t180} />
-          <Stat label="140+" value={x.t140} />
-          <Stat label="100+" value={x.t100} />
-          <Stat label="Bestes Leg" value={x.bestLegDarts ?? '–'} sub="Darts" />
-          <Stat label="Legs gewonnen" value={x.legsWon} />
-        </View>
-      </Card>
-      <Card>
-        <H2>Cricket · {c.matches} Spiele</H2>
-        <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 8 }}>
-          <Stat label="MPR" value={c.mpr.toFixed(2)} sub="Marks pro Runde" />
-          <Stat label="Marks" value={c.marks} />
-          <Stat label="Legs gewonnen" value={c.legsWon} />
-        </View>
-      </Card>
-      <Card>
-        <H2>Letzte Spiele</H2>
-        {data.recent.length === 0 ? <P muted>Noch keine beendeten Spiele.</P> : null}
-        {data.recent.map((m) => (
-          <Pressable
-            key={m.id}
-            onPress={() => router.push(`/match/${m.id}`)}
-            style={{ flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: radius.md, backgroundColor: colors.bg }}
-          >
-            <Badge label={m.won ? 'Sieg' : 'Niederlage'} color={m.won ? colors.accent : colors.danger} />
-            <View style={{ flex: 1 }}>
-              <Text style={{ color: colors.text, fontWeight: '700' }}>{m.title}</Text>
-              <Text style={{ color: colors.muted, fontSize: 13 }}>
-                {m.opponents.length ? `vs. ${m.opponents.join(', ')}` : 'Training'} · {new Date(m.finishedAt).toLocaleDateString()}
-              </Text>
+    <Screen maxWidth={1280} style={{ gap: 20, paddingBottom: 40 }}>
+      {/* filters: one row above everything they scope */}
+      <View style={{ flexDirection: wide ? 'row' : 'column', alignItems: wide ? 'center' : 'stretch', gap: 12 }}>
+        <Segmented options={RANGES} value={range} onChange={setRange} style={wide ? { width: 340 } : undefined} />
+        <View style={{ flex: wide ? 1 : undefined, gap: 6, minWidth: 0 }}>
+          {friends.friends.length ? (
+            <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+              <Text style={[kit.cardTitle, { flexShrink: 0 }]}>Vergleichen mit</Text>
+              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 8, paddingVertical: 2 }}>
+                {friends.friends.map((f) => (
+                  <Chip
+                    key={f.id}
+                    label={f.displayName}
+                    selected={f.id === friendId}
+                    color={SERIES_COLORS.friend}
+                    onPress={() => setFriendId((cur) => (cur === f.id ? null : f.id))}
+                  />
+                ))}
+              </ScrollView>
             </View>
-            <Text style={{ color: colors.text, fontWeight: '800' }}>{m.mode === 'x01' ? `Ø ${m.average.toFixed(1)}` : `MPR ${m.mpr.toFixed(2)}`}</Text>
-            <Ionicons name="chevron-forward" size={16} color={colors.muted} />
-          </Pressable>
-        ))}
-      </Card>
+          ) : friends.loaded ? (
+            <Pressable onPress={() => router.push('/friends')} accessibilityRole="link" style={{ flexDirection: 'row', alignItems: 'center', gap: 6 }}>
+              <Ionicons name="people-outline" size={16} color={colors.muted} />
+              <Text style={{ color: colors.muted, fontSize: 13 }}>Füge Freunde hinzu, um deine Statistik mit ihnen zu vergleichen</Text>
+              <Ionicons name="chevron-forward" size={14} color={colors.muted} />
+            </Pressable>
+          ) : null}
+          {activeFriend && theirs.error ? <Text style={{ color: colors.danger, fontSize: 12 }}>{theirs.error}</Text> : null}
+        </View>
+      </View>
+      {friendData ? <Legend series={series} kind="dot" style={{ paddingHorizontal: 4 }} /> : null}
+      {mine.error ? <ErrorText>{mine.error}</ErrorText> : null}
+
+      <View style={{ gap: 28, opacity: pending ? 0.55 : 1 }}>
+        {empty ? (
+          <Card style={{ alignItems: 'center', padding: 32, gap: 12 }}>
+            <View style={{ width: 64, height: 64, borderRadius: 32, backgroundColor: colors.surfaceAlt, alignItems: 'center', justifyContent: 'center' }}>
+              <Ionicons name="stats-chart" size={28} color={colors.muted} />
+            </View>
+            <Text style={{ color: colors.text, fontSize: 20, fontWeight: '800', textAlign: 'center' }}>
+              {range === 'all' ? 'Noch keine Statistik' : 'Keine Spiele in diesem Zeitraum'}
+            </Text>
+            <Text style={{ color: colors.muted, fontSize: 15, lineHeight: 21, textAlign: 'center', maxWidth: 420 }}>
+              Spiel ein Match als „du“ – danach findest du hier Averages, Doppelquoten, dein Trefferbild, Rekorde und den Vergleich mit deinen
+              Freunden.
+            </Text>
+            {range !== 'all' ? (
+              <Button title="Alle Spiele zeigen" variant="secondary" onPress={() => setRange('all')} />
+            ) : (
+              <Button title="Spiel starten" icon="play" onPress={() => router.push('/')} />
+            )}
+          </Card>
+        ) : (
+          <>
+            <OverviewSection ctx={ctx} />
+            <X01Section ctx={ctx} />
+            <CricketSection ctx={ctx} />
+            <AtcSection ctx={ctx} />
+            <HeatSection ctx={ctx} />
+            <HeadToHeadSection ctx={ctx} friendIds={friendIds} onCompare={(id) => setFriendId((cur) => (cur === id ? null : id))} />
+            <RecentSection ctx={ctx} />
+          </>
+        )}
+      </View>
     </Screen>
   );
 }

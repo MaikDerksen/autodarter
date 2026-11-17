@@ -191,3 +191,65 @@ describe('cricket', () => {
     expect(st.winner).toBe(0);
   });
 });
+
+describe('around the clock', () => {
+  const atc: MatchSettings = { mode: 'atc', hits: 'any', skip: false, bull: true, legs: 1 };
+  const solo: PlayerInfo[] = [{ id: 'a', name: 'Anna' }];
+
+  it('advances on the target number only', () => {
+    const st = computeMatch(atc, players, [d('1'), d('3'), d('T2')]);
+    expect(st.atc?.progress[0]).toBe(2);
+    expect(st.turn.darts.map((x) => x.hit)).toEqual([true, false, true]);
+    expect(st.turn.points).toBe(2);
+    expect(st.turn.marks).toBe(2);
+  });
+
+  it('jumps with doubles and triples when enabled, but never past the bull', () => {
+    const skip: MatchSettings = { ...atc, skip: true };
+    expect(computeMatch(skip, players, [d('T1'), d('D4')]).atc?.progress[0]).toBe(5);
+    const ev: MatchEvent[] = [];
+    // 1..18 with singles, then T19 -> lands on the bull (index 20), not finished
+    for (let n = 1; n <= 18; n++) {
+      ev.push(d(String(n)));
+      if (n % 3 === 0) ev.push(next(), d('MISS'), d('MISS'), d('MISS'), next());
+    }
+    ev.push(d('T19'));
+    const st = computeMatch(skip, solo, ev);
+    expect(st.atc?.progress[0]).toBe(20);
+    expect(st.finished).toBe(false);
+    const done = computeMatch(skip, solo, [...ev, d('25')]);
+    expect(done.finished).toBe(true);
+    expect(done.winner).toBe(0);
+  });
+
+  it('only counts doubles in the double variant (bullseye for the bull)', () => {
+    const dbl: MatchSettings = { ...atc, hits: 'double' };
+    const st = computeMatch(dbl, players, [d('1'), d('T1'), d('D1')]);
+    expect(st.atc?.progress[0]).toBe(1);
+  });
+
+  it('finishes without bull after the 20 and counts hit rate', () => {
+    const noBull: MatchSettings = { ...atc, bull: false };
+    const ev: MatchEvent[] = [];
+    for (let n = 1; n <= 20; n++) {
+      ev.push(d(String(n)));
+      if (n % 3 === 0 && n < 20) ev.push(next());
+    }
+    const st = computeMatch(noBull, solo, ev);
+    expect(st.finished).toBe(true);
+    expect(st.stats[0].hits).toBe(20);
+    expect(st.stats[0].dartsThrown).toBe(20);
+    expect(st.stats[0].hitRate).toBe(100);
+    expect(st.stats[0].bestLegDarts).toBe(20);
+  });
+});
+
+describe('statistics', () => {
+  it('counts the checkout dart (average, best leg)', () => {
+    const s: MatchSettings = { mode: 'x01', startScore: 101, inMode: 'straight', outMode: 'double', legs: 1 };
+    const st = computeMatch(s, [{ id: 'a', name: 'Anna' }], [d('T20'), d('S1'), d('D20')]);
+    expect(st.stats[0].dartsThrown).toBe(3);
+    expect(st.stats[0].average).toBe(101);
+    expect(st.stats[0].bestLegDarts).toBe(3);
+  });
+});

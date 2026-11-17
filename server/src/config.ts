@@ -19,4 +19,18 @@ export const config = {
   webDir: process.env.WEB_DIR ?? path.resolve(here, '../../app/dist'),
   allowRegistration: (process.env.ALLOW_REGISTRATION ?? 'true').toLowerCase() !== 'false',
   logLevel: process.env.LOG_LEVEL ?? 'info',
+  /** Live camera stream sent by the boards while somebody watches (lower it on slow uploads). */
+  streamFps: Number(process.env.STREAM_FPS ?? 4),
+  streamMaxWidth: Number(process.env.STREAM_MAX_WIDTH ?? 640),
+  /** A running match blocks its board; after this many idle minutes others may start a new match. */
+  boardIdleMinutes: Number(process.env.BOARD_IDLE_MINUTES ?? 30),
+  /** Running matches without any dart for this long are ended automatically. */
+  staleMatchHours: Number(process.env.STALE_MATCH_HOURS ?? 12),
+  /** Usernames that may update the server from the app (comma separated). Empty = the first registered account. */
+  adminUsers: (process.env.ADMIN_USERS ?? '')
+    .split(',')
+    .map((u) => u.trim().toLowerCase())
+    .filter(Boolean),
+  /** Set at image build time (CI), shown in the app. */
+  version: process.env.AUTODARTER_VERSION ?? 'dev',
 };

@@ -1,6 +1,20 @@
 # Autodarter – server stack (web app + API + database).
-# Start:  cp .env.example .env  (set JWT_SECRET!)  &&  docker compose up -d --build
-# Then open http://<server-ip>:3000
+#
+#   cp .env.example .env            # set JWT_SECRET (and DOMAIN / tunnel token, see below)
+#
+# Images from the registry (recommended, set AUTODARTER_REGISTRY in .env):
+#   docker compose pull && docker compose up -d
+# … or build locally from this repository:
+#   docker compose up -d --build
+#
+# Reachable from the internet (e.g. server at home, Pi in the office) – pick ONE:
+#   --profile https    Caddy + Let's Encrypt, needs port forwarding 80/443 + DNS name
+#   --profile tunnel   Cloudflare Tunnel, no port forwarding (works with DS-Lite/CGNAT)
+# Automatic updates from the registry:  --profile autoupdate
+# Several profiles at once, e.g. in .env:  COMPOSE_PROFILES=tunnel,autoupdate
+#
+# Local test without hardware (simulated board on http://localhost:3180):
+#   docker compose --profile demo up -d --build
 
 services:
   db:
@@ -19,10 +33,11 @@ services:
       retries: 20
 
   server:
+    # localhost/… = built locally; with AUTODARTER_REGISTRY=ghcr.io/<user> it comes from the registry
+    image: ${AUTODARTER_REGISTRY:-localhost}/autodarter-server:${AUTODARTER_TAG:-latest}
     build:
       context: .
       dockerfile: server/Dockerfile
-    image: autodarter/server:latest
     restart: unless-stopped
     depends_on:
       db:
@@ -32,8 +47,81 @@ services:
       JWT_SECRET: ${JWT_SECRET:?Bitte JWT_SECRET in .env setzen}
       ALLOW_REGISTRATION: ${ALLOW_REGISTRATION:-true}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      STREAM_FPS: ${STREAM_FPS:-4}
+      STREAM_MAX_WIDTH: ${STREAM_MAX_WIDTH:-640}
+      BOARD_IDLE_MINUTES: ${BOARD_IDLE_MINUTES:-30}
+      STALE_MATCH_HOURS: ${STALE_MATCH_HOURS:-12}
+      # who may update the server from the app (usernames, comma separated) – empty = the first account
+      ADMIN_USERS: ${ADMIN_USERS:-}
     ports:
+      # plain HTTP for the home network; from the internet only through caddy / tunnel
       - "${PORT:-3000}:3000"
+
+  # HTTPS with automatic certificates (Let's Encrypt)
+  caddy:
+    profiles: ["https"]
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      DOMAIN: ${DOMAIN:-}   # required for this profile, e.g. darts.example.duckdns.org
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+
+  # Cloudflare Tunnel: outgoing connection to Cloudflare, no open ports at home.
+  # In the Cloudflare dashboard route your hostname to  http://server:3000
+  tunnel:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest
+    restart: unless-stopped
+    depends_on:
+      - server
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}   # required for this profile
+
+  # Pulls new images regularly and restarts what changed – never while somebody is playing.
+  updater:
+    profiles: ["autoupdate"]
+    image: ${AUTODARTER_REGISTRY:-localhost}/autodarter-updater:${AUTODARTER_TAG:-latest}
+    build: ./updater
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/Berlin}
+      UPDATE_INTERVAL: ${UPDATE_INTERVAL:-21600}
+      UPDATE_HOURS: ${UPDATE_HOURS:-}
+      UPDATE_EXCLUDE: ${UPDATE_EXCLUDE:-}
+      UPDATE_BUSY_URL: http://server:3000/api/health
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - .:/project
+      # private registry: run "docker login ghcr.io" on the host once, the updater uses that login
+      - ${HOME:-/root}/.docker:/root/.docker:ro
+
+  # Demo / local test without hardware: a simulated board with 3 virtual cameras.
+  demo-board:
+    profiles: ["demo"]
+    image: ${AUTODARTER_REGISTRY:-localhost}/autodarter-server-board:${AUTODARTER_TAG:-latest}
+    build: ./board
+    restart: unless-stopped
+    depends_on:
+      - server
+    environment:
+      AUTODARTER_SERVER: http://server:3000
+      CAMERA_SOURCE: sim
+    volumes:
+      - demo-board-data:/data
+    ports:
+      - "3180:3180"
 
 volumes:
   pgdata:
+  caddy-data:
+  caddy-config:
+  demo-board-data:

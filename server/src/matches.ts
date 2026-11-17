@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { isValidSegment, parseSegment, scoreFromCoords, type Segment } from '@shared/board';
 import {
   computeMatch,
+  describeSettings,
   undoEvents,
   validateSettings,
   type MatchEvent,
@@ -10,11 +11,15 @@ import {
   type MatchState,
   type PlayerInfo,
 } from '@shared/match';
-import type { DetectedDart, MatchStatus, MatchSummary, ServerToClient } from '@shared/protocol';
+import type { BoardActiveMatch, DetectedDart, MatchStatus, MatchSummary, ServerToClient } from '@shared/protocol';
+import type { MatchVoice } from '@shared/voice';
 import { boardEvents, canAccessBoard, publishBoardStatus, sendToBoard, setActiveMatchLookup } from './boards';
+import { config } from './config';
 import { pool, query } from './db';
+import { areFriends } from './friends';
 import { HttpError, authenticate, parse, userId } from './http';
-import { publishMatch } from './hub';
+import { publishMatch, sendToUser } from './hub';
+import { activePackOf, matchVoice } from './voice';
 
 interface MatchRow {
   id: string;
@@ -27,20 +32,75 @@ interface MatchRow {
   winner: number | null;
   created_at: Date;
   finished_at: Date | null;
+  voice_pack_id: string | null;
 }
 
 interface LiveMatch {
   row: MatchRow;
   state: MatchState;
   lock: Promise<unknown>;
+  ownerName: string;
+  voice: MatchVoice | null;
 }
 
 const cache = new Map<string, LiveMatch>();
+/** The running match per board – a board can only host one match at a time (remote matches use several boards). */
 const activeByBoard = new Map<string, string>();
 
-setActiveMatchLookup((boardId) => activeByBoard.get(boardId) ?? null);
+/** Board a player throws at: their own one in a remote match, otherwise the board of the match. */
+function playerBoard(row: MatchRow, player: number): string | null {
+  return row.players[player]?.boardId ?? row.board_id;
+}
 
-function toSummary(row: MatchRow): MatchSummary {
+/** All boards a match uses. */
+function matchBoards(row: MatchRow): string[] {
+  const ids = [row.board_id, ...row.players.map((p) => p.boardId ?? null)].filter((b): b is string => !!b);
+  return [...new Set(ids)];
+}
+
+/** A player of a running match may watch the boards of that match (remote play), even without board access. */
+export function guestCanWatchBoard(boardId: string, user: string): boolean {
+  const id = activeByBoard.get(boardId);
+  const m = id ? cache.get(id) : undefined;
+  return !!m && m.row.status === 'running' && canControl(m, user);
+}
+
+/** Time of the last dart / turn change (or the start of the match). */
+function lastActivity(m: LiveMatch): number {
+  const ev = m.row.events[m.row.events.length - 1];
+  return ev?.at ?? m.row.created_at.getTime();
+}
+
+function activeInfo(m: LiveMatch): BoardActiveMatch {
+  return {
+    id: m.row.id,
+    ownerId: m.row.owner_id,
+    ownerName: m.ownerName,
+    title: describeSettings(m.row.settings),
+    players: m.row.players.map((p) => p.name),
+    lastActivity: new Date(lastActivity(m)).toISOString(),
+  };
+}
+
+function activeMatchOn(boardId: string): LiveMatch | null {
+  const id = activeByBoard.get(boardId);
+  const m = id ? cache.get(id) : undefined;
+  return m && m.row.status === 'running' ? m : null;
+}
+
+setActiveMatchLookup((boardId) => {
+  const m = activeMatchOn(boardId);
+  return m ? activeInfo(m) : null;
+});
+
+/** Somebody is playing right now (used by the auto-updater to postpone updates). */
+export function serverBusy(): boolean {
+  const cutoff = Date.now() - 15 * 60 * 1000;
+  for (const m of cache.values()) if (m.row.status === 'running' && lastActivity(m) > cutoff) return true;
+  return false;
+}
+
+function toSummary(row: MatchRow, voice: MatchVoice | null = null): MatchSummary {
   return {
     id: row.id,
     settings: row.settings,
@@ -50,6 +110,7 @@ function toSummary(row: MatchRow): MatchSummary {
     winner: row.winner,
     createdAt: row.created_at.toISOString(),
     finishedAt: row.finished_at ? row.finished_at.toISOString() : null,
+    voice,
   };
 }
 
@@ -59,7 +120,14 @@ async function load(id: string): Promise<LiveMatch | null> {
   if (!/^[0-9a-f-]{36}$/i.test(id)) return null;
   const [row] = await query<MatchRow>('SELECT * FROM matches WHERE id = $1', [id]);
   if (!row) return null;
-  const m: LiveMatch = { row, state: computeMatch(row.settings, row.players, row.events), lock: Promise.resolve() };
+  const [owner] = await query<{ display_name: string }>('SELECT display_name FROM users WHERE id = $1', [row.owner_id]);
+  const m: LiveMatch = {
+    row,
+    state: computeMatch(row.settings, row.players, row.events),
+    lock: Promise.resolve(),
+    ownerName: owner?.display_name ?? '?',
+    voice: await matchVoice(row.voice_pack_id ?? null).catch(() => null),
+  };
   cache.set(id, m);
   // keep the cache small: forget finished matches nobody needs
   if (cache.size > 500) {
@@ -71,16 +139,55 @@ async function load(id: string): Promise<LiveMatch | null> {
   return m;
 }
 
-export async function canAccessMatch(id: string, user: string): Promise<boolean> {
-  const m = await load(id);
-  if (!m) return false;
+/** Creator and players with an account may enter darts, undo etc. */
+function canControl(m: LiveMatch, user: string): boolean {
   return m.row.owner_id === user || m.row.players.some((p) => p.userId === user);
 }
 
-async function loadOwned(id: string, user: string): Promise<LiveMatch> {
+/** Players and everybody who has the match's board in their account may watch. */
+export async function canViewMatch(id: string, user: string): Promise<boolean> {
   const m = await load(id);
-  if (!m || !(await canAccessMatch(id, user))) throw new HttpError(404, 'Spiel nicht gefunden');
+  if (!m) return false;
+  if (canControl(m, user)) return true;
+  return !!(m.row.board_id && (await canAccessBoard(m.row.board_id, user)));
+}
+
+async function loadViewable(id: string, user: string): Promise<LiveMatch> {
+  const m = await load(id);
+  if (!m || !(await canViewMatch(id, user))) throw new HttpError(404, 'Spiel nicht gefunden');
   return m;
+}
+
+async function loadControllable(id: string, user: string): Promise<LiveMatch> {
+  const m = await loadViewable(id, user);
+  if (!canControl(m, user)) throw new HttpError(403, 'Du schaust nur zu – eingeben können nur die Mitspieler');
+  return m;
+}
+
+/**
+ * Keep activeByBoard in line with the match status and its boards (finish, undo of the finishing dart,
+ * abort, a player switching to their own board). Returns the boards whose status changed.
+ */
+function syncActive(m: LiveMatch): string[] {
+  const changed: string[] = [];
+  const boards = m.row.status === 'running' ? matchBoards(m.row) : [];
+  for (const [b, id] of activeByBoard) {
+    if (id === m.row.id && !boards.includes(b)) {
+      activeByBoard.delete(b);
+      changed.push(b);
+    }
+  }
+  for (const b of boards) {
+    if (!activeByBoard.has(b)) {
+      activeByBoard.set(b, m.row.id);
+      changed.push(b);
+    }
+  }
+  return changed;
+}
+
+async function publishBoards(ids: string[]): Promise<void> {
+  for (const b of ids) await publishBoardStatus(b).catch(() => undefined);
 }
 
 function stateMessage(m: LiveMatch): ServerToClient {
@@ -107,7 +214,7 @@ function mutate(m: LiveMatch, fn: (events: MatchEvent[], state: MatchState) => M
     if (!events) return m.state;
     let state = computeMatch(m.row.settings, m.row.players, events);
     // Without a board there is no takeout: advance automatically after a complete turn.
-    if (!m.row.board_id && state.awaitingNext && !state.finished) {
+    if (!playerBoard(m.row, state.turn.player) && state.awaitingNext && !state.finished) {
       events = [...events, { t: 'next', at: Date.now() }];
       state = computeMatch(m.row.settings, m.row.players, events);
     }
@@ -123,6 +230,7 @@ function mutate(m: LiveMatch, fn: (events: MatchEvent[], state: MatchState) => M
     m.row = { ...m.row, events, status, winner: state.winner, finished_at: finishedAt };
     m.state = state;
     publish(m);
+    await publishBoards(syncActive(m));
     return state;
   };
   const p = m.lock.then(run, run);
@@ -143,7 +251,10 @@ boardEvents.on('dart', async (boardId: string, dart: DetectedDart) => {
   if (!m || m.row.status !== 'running') return;
   const seg = Number.isFinite(dart.x) && Number.isFinite(dart.y) ? scoreFromCoords(dart.x, dart.y) : dart.seg;
   await mutate(m, (events, state) =>
-    state.awaitingNext || state.finished ? null : [...events, dartEvent(seg, 'board', dart.x, dart.y)],
+    // remote play: only the board of the player whose turn it is counts
+    state.awaitingNext || state.finished || playerBoard(m.row, state.currentPlayer) !== boardId
+      ? null
+      : [...events, dartEvent(seg, 'board', dart.x, dart.y)],
   ).catch(() => undefined);
 });
 
@@ -153,18 +264,19 @@ boardEvents.on('takeout_finished', async (boardId: string) => {
   const m = await load(matchId);
   if (!m || m.row.status !== 'running') return;
   await mutate(m, (events, state) =>
-    !state.finished && (state.awaitingNext || state.turn.darts.length > 0)
+    !state.finished && (state.awaitingNext || state.turn.darts.length > 0) && playerBoard(m.row, state.turn.player) === boardId
       ? [...events, { t: 'next', at: Date.now() }]
       : null,
   ).catch(() => undefined);
 });
 
 export async function restoreActiveMatches(): Promise<void> {
-  const rows = await query<{ id: string; board_id: string }>(
-    `SELECT DISTINCT ON (board_id) id, board_id FROM matches
-     WHERE board_id IS NOT NULL AND status = 'running' ORDER BY board_id, created_at DESC`,
-  );
-  for (const r of rows) activeByBoard.set(r.board_id, r.id);
+  const rows = await query<{ id: string }>(`SELECT id FROM matches WHERE status = 'running' ORDER BY created_at ASC`);
+  for (const r of rows) {
+    const m = await load(r.id);
+    // newer matches win if two running matches claim the same board
+    if (m) for (const b of matchBoards(m.row)) activeByBoard.set(b, m.row.id);
+  }
 }
 
 // ------------------------------------------------------------------ routes
@@ -197,15 +309,34 @@ const settingsSchema = z.discriminatedUnion('mode', [
     legs: z.number().int(),
     maxRounds: z.number().int(),
   }),
+  z.object({
+    mode: z.literal('atc'),
+    hits: z.enum(['any', 'double', 'triple']),
+    skip: z.boolean(),
+    bull: z.boolean(),
+    legs: z.number().int(),
+  }),
 ]);
 
 const createSchema = z.object({
   settings: settingsSchema,
   players: z
-    .array(z.object({ name: z.string().trim().min(1).max(30), self: z.boolean().optional() }))
+    .array(
+      z
+        .object({
+          name: z.string().trim().min(1).max(30).optional(),
+          /** the requesting user */
+          self: z.boolean().optional(),
+          /** a friend with an account (counts for their statistics) */
+          userId: z.string().uuid().optional(),
+        })
+        .refine((p) => p.self || p.userId || p.name, 'Spielername fehlt'),
+    )
     .min(1)
     .max(8),
   boardId: z.string().nullish(),
+  /** abort my own running match on the board */
+  force: z.boolean().optional(),
 });
 
 export async function matchRoutes(app: FastifyInstance): Promise<void> {
@@ -216,14 +347,44 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
     const body = parse(createSchema, req.body);
     const err = validateSettings(body.settings, body.players.length);
     if (err) throw new HttpError(400, err);
-    if (body.boardId && !(await canAccessBoard(body.boardId, user))) throw new HttpError(404, 'Board nicht gefunden');
-    if (body.players.filter((p) => p.self).length > 1) throw new HttpError(400, 'Nur ein Spieler kann „ich“ sein');
 
-    const players: PlayerInfo[] = body.players.map((p, i) => ({
-      id: `p${i + 1}`,
-      name: p.name,
-      userId: p.self ? user : null,
-    }));
+    // players: guests by name, me and friends by account
+    const accountIds = body.players.map((p) => (p.self ? user : (p.userId ?? null)));
+    const ids = accountIds.filter((x): x is string => !!x);
+    if (new Set(ids).size !== ids.length) throw new HttpError(400, 'Ein Spieler ist doppelt eingetragen');
+    for (const id of ids) {
+      if (id !== user && !(await areFriends(user, id))) throw new HttpError(403, 'Spieler mit Konto müssen mit dir befreundet sein');
+    }
+    const names = new Map(
+      (await query<{ id: string; display_name: string }>('SELECT id, display_name FROM users WHERE id = ANY($1::uuid[])', [ids])).map(
+        (u) => [u.id, u.display_name],
+      ),
+    );
+    const players: PlayerInfo[] = body.players.map((p, i) => {
+      const uid = accountIds[i];
+      if (uid && !names.has(uid)) throw new HttpError(404, 'Spieler nicht gefunden');
+      return { id: `p${i + 1}`, name: uid ? names.get(uid)! : p.name!, userId: uid };
+    });
+
+    // a board hosts one match at a time
+    if (body.boardId) {
+      if (!(await canAccessBoard(body.boardId, user))) throw new HttpError(404, 'Board nicht gefunden');
+      const active = activeMatchOn(body.boardId);
+      if (active) {
+        const idle = Date.now() - lastActivity(active) > config.boardIdleMinutes * 60 * 1000;
+        const mine = canControl(active, user);
+        if (!idle && !(mine && body.force)) {
+          const info = activeInfo(active);
+          throw new HttpError(
+            409,
+            mine
+              ? `Auf dem Board läuft noch dein Spiel (${info.title}).`
+              : `Das Board ist belegt: ${info.ownerName} spielt gerade ${info.title} (${info.players.join(' vs. ')}).`,
+            { code: 'board_busy', activeMatch: info, canForce: mine },
+          );
+        }
+      }
+    }
 
     const client = await pool.connect();
     let row: MatchRow;
@@ -236,8 +397,8 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
         );
       }
       const res = await client.query<MatchRow>(
-        'INSERT INTO matches(owner_id, board_id, settings, players) VALUES ($1, $2, $3, $4) RETURNING *',
-        [user, body.boardId ?? null, JSON.stringify(body.settings), JSON.stringify(players)],
+        'INSERT INTO matches(owner_id, board_id, settings, players, voice_pack_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
+        [user, body.boardId ?? null, JSON.stringify(body.settings), JSON.stringify(players), await activePackOf(user)],
       );
       row = res.rows[0];
       for (const [i, p] of players.entries()) {
@@ -254,20 +415,61 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
     }
 
     if (body.boardId) {
-      const previous = activeByBoard.get(body.boardId);
-      if (previous) {
-        const old = cache.get(previous);
-        if (old && old.row.status === 'running') {
-          old.row = { ...old.row, status: 'aborted' };
-          publish(old);
-        }
+      const old = activeMatchOn(body.boardId);
+      if (old) {
+        old.row = { ...old.row, status: 'aborted', finished_at: new Date() };
+        syncActive(old);
+        publish(old);
       }
       activeByBoard.set(body.boardId, row.id);
+    }
+    const m = (await load(row.id))!;
+    if (body.boardId) {
       sendToBoard(body.boardId, { type: 'command', action: 'reset' });
       await publishBoardStatus(body.boardId);
     }
-    const m = await load(row.id);
-    return { match: toSummary(m!.row), state: m!.state };
+    const summary = toSummary(m.row, m.voice);
+    for (const p of players) {
+      if (p.userId && p.userId !== user) {
+        sendToUser(p.userId, { type: 'match_invite', match: summary, from: { id: user, displayName: m.ownerName } });
+      }
+    }
+    return { match: summary, state: m.state, canControl: true };
+  });
+
+  /**
+   * Remote play: a player with an account throws at their own board (e.g. at home) instead of the
+   * board of the match. boardId null = back to the board of the match.
+   */
+  app.put<{ Params: { id: string; index: string } }>('/api/matches/:id/players/:index/board', async (req) => {
+    const user = userId(req);
+    const m = await loadControllable(req.params.id, user);
+    const index = Number(req.params.index);
+    const player = m.row.players[index];
+    if (!player) throw new HttpError(404, 'Spieler nicht gefunden');
+    if (player.userId !== user) throw new HttpError(403, 'Sein Board wählt jeder Spieler selbst');
+    if (m.row.status !== 'running') throw new HttpError(409, 'Spiel ist beendet');
+    const body = parse(z.object({ boardId: z.string().min(1).max(64).nullable() }), req.body);
+    let boardId = body.boardId === m.row.board_id ? null : body.boardId;
+    let boardName: string | null = null;
+    if (boardId) {
+      if (!(await canAccessBoard(boardId, user))) throw new HttpError(404, 'Board nicht gefunden');
+      const other = activeMatchOn(boardId);
+      if (other && other.row.id !== m.row.id) {
+        throw new HttpError(409, `Auf diesem Board läuft gerade ein anderes Spiel (${activeInfo(other).title}).`);
+      }
+      const [b] = await query<{ name: string }>('SELECT name FROM boards WHERE id = $1', [boardId]);
+      boardName = b?.name ?? null;
+    } else boardId = null;
+    const players = m.row.players.map((p, i) => (i === index ? { ...p, boardId, boardName } : p));
+    await query('UPDATE matches SET players = $2 WHERE id = $1', [m.row.id, JSON.stringify(players)]);
+    m.row = { ...m.row, players };
+    m.state = computeMatch(m.row.settings, m.row.players, m.row.events);
+    publish(m);
+    await publishBoards(syncActive(m));
+    if (boardId) sendToBoard(boardId, { type: 'command', action: 'reset' });
+    req.log.info({ match: m.row.id, player: index, board: boardId }, 'player board changed');
+    return { match: toSummary(m.row, m.voice), state: m.state };
   });
 
   app.get<{ Querystring: { status?: string; limit?: string } }>('/api/matches', async (req) => {
@@ -280,16 +482,16 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
        ORDER BY m.created_at DESC LIMIT $3`,
       [userId(req), status ?? null, limit],
     );
-    return rows.map(toSummary);
+    return rows.map((r) => toSummary(r));
   });
 
   app.get<{ Params: { id: string } }>('/api/matches/:id', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
-    return { match: toSummary(m.row), state: m.state };
+    const m = await loadViewable(req.params.id, userId(req));
+    return { match: toSummary(m.row, m.voice), state: m.state, canControl: canControl(m, userId(req)) };
   });
 
   app.post<{ Params: { id: string } }>('/api/matches/:id/darts', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
+    const m = await loadControllable(req.params.id, userId(req));
     const body = parse(z.object({ segment: segmentSchema }), req.body);
     const state = await mutate(m, (events, st) => {
       if (st.finished) throw new HttpError(409, 'Spiel ist beendet');
@@ -300,19 +502,19 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
   });
 
   app.post<{ Params: { id: string } }>('/api/matches/:id/next', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
+    const m = await loadControllable(req.params.id, userId(req));
     const state = await mutate(m, (events, st) => (st.finished ? null : [...events, { t: 'next', at: Date.now() }]));
     return { state };
   });
 
   app.post<{ Params: { id: string } }>('/api/matches/:id/undo', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
+    const m = await loadControllable(req.params.id, userId(req));
     const state = await mutate(m, (events) => (events.length === 0 ? null : undoEvents(events)));
     return { state };
   });
 
   app.put<{ Params: { id: string; index: string } }>('/api/matches/:id/events/:index', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
+    const m = await loadControllable(req.params.id, userId(req));
     const body = parse(z.object({ segment: segmentSchema }), req.body);
     const index = Number(req.params.index);
     const state = await mutate(m, (events) => {
@@ -326,16 +528,36 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
     return { state };
   });
 
+  /**
+   * End a match. Allowed for the players and – as emergency exit for forgotten matches that block
+   * the board – for everybody who has the board in their account.
+   */
   app.post<{ Params: { id: string } }>('/api/matches/:id/abort', async (req) => {
-    const m = await loadOwned(req.params.id, userId(req));
-    if (m.row.owner_id !== userId(req)) throw new HttpError(403, 'Nur der Ersteller kann das Spiel abbrechen');
-    await query(`UPDATE matches SET status = 'aborted', finished_at = now() WHERE id = $1 AND status = 'running'`, [m.row.id]);
-    if (m.row.status === 'running') m.row = { ...m.row, status: 'aborted', finished_at: new Date() };
-    if (m.row.board_id && activeByBoard.get(m.row.board_id) === m.row.id) {
-      activeByBoard.delete(m.row.board_id);
-      await publishBoardStatus(m.row.board_id);
-    }
-    publish(m);
+    const user = userId(req);
+    const m = await loadViewable(req.params.id, user);
+    req.log.info({ match: m.row.id, user }, 'match aborted');
+    await abortMatch(m);
     return { ok: true };
   });
+}
+
+async function abortMatch(m: LiveMatch): Promise<void> {
+  await query(`UPDATE matches SET status = 'aborted', finished_at = now() WHERE id = $1 AND status = 'running'`, [m.row.id]);
+  if (m.row.status === 'running') m.row = { ...m.row, status: 'aborted', finished_at: new Date() };
+  await publishBoards(syncActive(m));
+  publish(m);
+}
+
+/** Matches nobody threw a dart in for STALE_MATCH_HOURS are ended automatically (no "match corpses"). */
+export async function cleanupStaleMatches(): Promise<number> {
+  const rows = await query<{ id: string }>(
+    `SELECT id FROM matches WHERE status = 'running'
+       AND COALESCE(to_timestamp((events->-1->>'at')::double precision / 1000), created_at) < now() - make_interval(hours => $1)`,
+    [config.staleMatchHours],
+  );
+  for (const r of rows) {
+    const m = await load(r.id);
+    if (m) await abortMatch(m);
+  }
+  return rows.length;
 }
