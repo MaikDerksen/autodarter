@@ -97,6 +97,11 @@ const MIGRATIONS: string[] = [
   ALTER TABLE users ADD COLUMN voice_pack_id UUID REFERENCES voice_packs(id) ON DELETE SET NULL;
   ALTER TABLE matches ADD COLUMN voice_pack_id UUID REFERENCES voice_packs(id) ON DELETE SET NULL;
   `,
+  `
+  -- who speaks in a match: 'host' = pack of the creator for everybody, 'own' = every player their own
+  ALTER TABLE matches ADD COLUMN voice_mode TEXT NOT NULL DEFAULT 'host';
+  CREATE INDEX matches_running_idx ON matches(owner_id) WHERE status = 'running';
+  `,
 ];
 
 async function waitForDb(): Promise<void> {

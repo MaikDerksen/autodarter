@@ -1,6 +1,6 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { VOICE_MAX_BYTES, VOICE_MAX_PACKS, isVoiceKey, type MatchVoice, type VoicePack } from '@shared/voice';
+import { VOICE_MAX_BYTES, VOICE_MAX_PACKS, isVoiceKey, type MatchVoice, type VoiceMode, type VoicePack } from '@shared/voice';
 import { query } from './db';
 import { friendIds } from './friends';
 import { HttpError, authenticate, parse, userId } from './http';
@@ -53,7 +53,13 @@ async function ownPack(id: string, user: string): Promise<PackRow> {
   return pack;
 }
 
-/** Voice of a match = pack chosen by the creator (stored with the match). */
+/** May the user pick this pack (own pack or shared by a friend)? */
+export async function canUsePack(packId: string, user: string): Promise<boolean> {
+  const pack = await getPack(packId);
+  return !!pack && (await canUse(pack, user));
+}
+
+/** A pack as used in a match (null if it was deleted). */
 export async function matchVoice(packId: string | null): Promise<MatchVoice | null> {
   if (!packId) return null;
   const pack = await getPack(packId);
@@ -67,6 +73,33 @@ export async function activePackOf(user: string): Promise<string | null> {
   if (!u?.voice_pack_id) return null;
   const pack = await getPack(u.voice_pack_id);
   return pack && (await canUse(pack, user)) ? pack.id : null;
+}
+
+/**
+ * Voice per player of a match: explicit choice when the match was created, otherwise – in "own"
+ * mode – the pack the player chose in their profile, otherwise the pack of the host.
+ */
+export async function resolveVoices(
+  players: { userId?: string | null; voicePackId?: string | null }[],
+  mode: VoiceMode,
+  host: MatchVoice | null,
+): Promise<(MatchVoice | null)[]> {
+  const packs = new Map<string, Promise<MatchVoice | null>>();
+  const voiceOf = (id: string) => {
+    if (!packs.has(id)) packs.set(id, matchVoice(id).catch(() => null));
+    return packs.get(id)!;
+  };
+  return Promise.all(
+    players.map(async (p) => {
+      if (p.voicePackId === null) return null;
+      if (p.voicePackId) return voiceOf(p.voicePackId);
+      if (mode === 'own' && p.userId) {
+        const own = await activePackOf(p.userId).catch(() => null);
+        if (own) return voiceOf(own);
+      }
+      return host;
+    }),
+  );
 }
 
 const touch = (id: string) => query('UPDATE voice_packs SET updated_at = now() WHERE id = $1', [id]);

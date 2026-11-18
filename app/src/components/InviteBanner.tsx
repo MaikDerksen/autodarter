@@ -28,6 +28,12 @@ export function InviteBanner() {
   }, []);
 
   useLiveMessages((msg) => {
+    if (msg.type === 'match_joined') {
+      // the match screen shows it anyway - only a short notice elsewhere
+      const text = `${msg.user.displayName} spielt jetzt bei ${msg.title} mit`;
+      setNotices((n) => [...n, { key: `join${msg.matchId}${msg.user.id}`, text }]);
+      return;
+    }
     if (msg.type !== 'match_invite') return;
     const players = msg.match.players.map((p) => p.name).join(' vs. ');
     const text = `${msg.from.displayName} hat dich zu ${describeSettings(msg.match.settings)} eingeladen (${players})`;

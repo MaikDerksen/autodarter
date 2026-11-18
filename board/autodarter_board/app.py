@@ -217,7 +217,43 @@ class BoardApp:
             "cameras": cams,
             "message": message,
             "version": BUILD_VERSION or __version__,
-            "capabilities": {"restart": True, "reboot": self.can_reboot(), "update": self.can_update()},
+            "capabilities": {"restart": True, "reboot": self.can_reboot(), "update": self.can_update(), "autoCalibrate": True},
+        }
+
+    def auto_calibrate(self, index: int, prior, hint20) -> dict:
+        """Find the board in the current image of a camera. Only a proposal: the app shows it and saves it."""
+
+        def fail(message: str) -> dict:
+            return {"ok": False, "points": None, "score": 0.0, "mode": "full", "needsHint": False, "message": message}
+
+        cam = self.cameras.by_index(index)
+        if cam is None:
+            return fail("Kamera nicht gefunden")
+        _, frame = cam.latest()
+        if frame is None:
+            return fail("Die Kamera liefert gerade kein Bild")
+        try:
+            from .autocal import auto_calibrate
+
+            pts = [(float(p["x"]), float(p["y"])) for p in prior] if isinstance(prior, list) and len(prior) == 5 else None
+            hint = (float(hint20["x"]), float(hint20["y"])) if isinstance(hint20, dict) else None
+            started = time.time()
+            res = auto_calibrate(frame, prior=pts, hint20=hint)
+        except Exception as exc:  # never take the board client down
+            log.exception("auto calibration of camera %s failed", index + 1)
+            return fail(f"Automatische Erkennung fehlgeschlagen: {exc}")
+        out = res.get("points")
+        log.info(
+            "Auto-Kalibrierung Kamera %s: ok=%s score=%.2f mode=%s (%.1f s)",
+            index + 1, res.get("ok"), float(res.get("score") or 0), res.get("mode"), time.time() - started,
+        )
+        return {
+            "ok": bool(res.get("ok")),
+            "points": [{"x": float(x), "y": float(y)} for x, y in out] if out else None,
+            "score": round(float(res.get("score") or 0), 3),
+            "mode": "refine" if res.get("mode") == "refine" else "full",
+            "needsHint": bool(res.get("needsHint")),
+            "message": str(res.get("message") or ""),
         }
 
     def can_reboot(self) -> bool:
@@ -406,6 +442,10 @@ class BoardApp:
                 if frame is not None:
                     data, w, h = await asyncio.to_thread(encode_jpeg, frame, None, 90)
             await self.send({"type": "snapshot", "requestId": msg.get("requestId"), "camera": int(msg.get("camera", 0)), "data": data, "width": w, "height": h})
+        elif t == "auto_calibrate":
+            index = int(msg.get("camera", 0))
+            result = await asyncio.to_thread(self.auto_calibrate, index, msg.get("prior"), msg.get("hint20"))
+            await self.send({"type": "auto_calibration", "requestId": msg.get("requestId"), "camera": index, "result": result})
         elif t == "set_calibration":
             cam = self.cameras.by_index(int(msg.get("camera", -1)))
             if cam is None:

@@ -11,15 +11,15 @@ import {
   type MatchState,
   type PlayerInfo,
 } from '@shared/match';
-import type { BoardActiveMatch, DetectedDart, MatchStatus, MatchSummary, ServerToClient } from '@shared/protocol';
-import type { MatchVoice } from '@shared/voice';
+import type { BoardActiveMatch, DetectedDart, FriendMatch, MatchStatus, MatchSummary, ServerToClient } from '@shared/protocol';
+import type { MatchVoice, VoiceMode } from '@shared/voice';
 import { boardEvents, canAccessBoard, publishBoardStatus, sendToBoard, setActiveMatchLookup } from './boards';
 import { config } from './config';
 import { pool, query } from './db';
-import { areFriends } from './friends';
+import { areFriends, friendIds } from './friends';
 import { HttpError, authenticate, parse, userId } from './http';
 import { publishMatch, sendToUser } from './hub';
-import { activePackOf, matchVoice } from './voice';
+import { activePackOf, canUsePack, matchVoice, resolveVoices } from './voice';
 
 interface MatchRow {
   id: string;
@@ -33,6 +33,7 @@ interface MatchRow {
   created_at: Date;
   finished_at: Date | null;
   voice_pack_id: string | null;
+  voice_mode: VoiceMode;
 }
 
 interface LiveMatch {
@@ -41,6 +42,8 @@ interface LiveMatch {
   lock: Promise<unknown>;
   ownerName: string;
   voice: MatchVoice | null;
+  /** voice per player */
+  voices: (MatchVoice | null)[];
 }
 
 const cache = new Map<string, LiveMatch>();
@@ -100,7 +103,7 @@ export function serverBusy(): boolean {
   return false;
 }
 
-function toSummary(row: MatchRow, voice: MatchVoice | null = null): MatchSummary {
+function toSummary(row: MatchRow, voice: MatchVoice | null = null, voices?: (MatchVoice | null)[]): MatchSummary {
   return {
     id: row.id,
     settings: row.settings,
@@ -111,7 +114,33 @@ function toSummary(row: MatchRow, voice: MatchVoice | null = null): MatchSummary
     createdAt: row.created_at.toISOString(),
     finishedAt: row.finished_at ? row.finished_at.toISOString() : null,
     voice,
+    voiceMode: row.voice_mode ?? 'host',
+    ...(voices ? { voices } : {}),
   };
+}
+
+const summaryOf = (m: LiveMatch) => toSummary(m.row, m.voice, m.voices);
+
+/** Friends of the host see the match in their suggestions - tell them to reload. */
+function notifyFriends(owner: string): void {
+  friendIds(owner)
+    .then((ids) => ids.forEach((id) => sendToUser(id, { type: 'friend_matches' })))
+    .catch(() => undefined);
+}
+
+/**
+ * Why nobody can join any more (null = joining is possible). A new player is appended at the end of
+ * the order, so this only works while the first round of the first leg is still running - exactly
+ * when every turn thrown so far keeps its player.
+ */
+function joinBlocked(m: LiveMatch): string | null {
+  if (m.row.status !== 'running' || m.state.finished) return 'Das Spiel ist schon beendet.';
+  if (m.row.players.length >= 8) return 'Das Spiel ist voll (8 Spieler).';
+  if (validateSettings(m.row.settings, m.row.players.length + 1)) return 'In diesem Modus passt kein weiterer Spieler dazu.';
+  const probe = computeMatch(m.row.settings, [...m.row.players, { id: 'probe', name: '?' }], m.row.events);
+  const order = (st: MatchState) => `${st.legs.map((l) => l.turns.map((t) => t.player).join(',')).join('/')}|${st.turn.player}`;
+  if (m.state.legs.length > 1 || order(probe) !== order(m.state)) return 'Die erste Runde ist schon vorbei.';
+  return null;
 }
 
 async function load(id: string): Promise<LiveMatch | null> {
@@ -126,8 +155,14 @@ async function load(id: string): Promise<LiveMatch | null> {
     state: computeMatch(row.settings, row.players, row.events),
     lock: Promise.resolve(),
     ownerName: owner?.display_name ?? '?',
-    voice: await matchVoice(row.voice_pack_id ?? null).catch(() => null),
+    voice: null,
+    voices: [],
   };
+  m.voice = await matchVoice(row.voice_pack_id ?? null).catch(() => null);
+  m.voices = await resolveVoices(row.players, row.voice_mode ?? 'host', m.voice).catch(() => row.players.map(() => m.voice));
+  // loaded twice at the same time: keep the first one, it may already be in use
+  const raced = cache.get(id);
+  if (raced) return raced;
   cache.set(id, m);
   // keep the cache small: forget finished matches nobody needs
   if (cache.size > 500) {
@@ -144,12 +179,13 @@ function canControl(m: LiveMatch, user: string): boolean {
   return m.row.owner_id === user || m.row.players.some((p) => p.userId === user);
 }
 
-/** Players and everybody who has the match's board in their account may watch. */
+/** Players, everybody who has the match's board in their account and friends of the host may watch. */
 export async function canViewMatch(id: string, user: string): Promise<boolean> {
   const m = await load(id);
   if (!m) return false;
   if (canControl(m, user)) return true;
-  return !!(m.row.board_id && (await canAccessBoard(m.row.board_id, user)));
+  if (m.row.board_id && (await canAccessBoard(m.row.board_id, user))) return true;
+  return areFriends(m.row.owner_id, user);
 }
 
 async function loadViewable(id: string, user: string): Promise<LiveMatch> {
@@ -207,8 +243,14 @@ export async function matchSnapshot(id: string): Promise<ServerToClient | null> 
  * Serialised mutation of a match: fn gets the current events and returns the new list
  * (or null for "no change"). State is recomputed, persisted and broadcast.
  */
+function locked<T>(m: LiveMatch, fn: () => Promise<T>): Promise<T> {
+  const p = m.lock.then(fn, fn);
+  m.lock = p.catch(() => undefined);
+  return p;
+}
+
 function mutate(m: LiveMatch, fn: (events: MatchEvent[], state: MatchState) => MatchEvent[] | null): Promise<MatchState> {
-  const run = async (): Promise<MatchState> => {
+  return locked(m, async (): Promise<MatchState> => {
     if (m.row.status === 'aborted') throw new HttpError(409, 'Spiel wurde abgebrochen');
     let events = fn(m.row.events, m.state);
     if (!events) return m.state;
@@ -227,15 +269,14 @@ function mutate(m: LiveMatch, fn: (events: MatchEvent[], state: MatchState) => M
       state.winner,
       finishedAt,
     ]);
+    const statusChanged = status !== m.row.status;
     m.row = { ...m.row, events, status, winner: state.winner, finished_at: finishedAt };
     m.state = state;
     publish(m);
     await publishBoards(syncActive(m));
+    if (statusChanged) notifyFriends(m.row.owner_id);
     return state;
-  };
-  const p = m.lock.then(run, run);
-  m.lock = p.catch(() => undefined);
-  return p;
+  });
 }
 
 function dartEvent(seg: Segment, src: 'board' | 'manual', x?: number, y?: number): MatchEvent {
@@ -329,12 +370,15 @@ const createSchema = z.object({
           self: z.boolean().optional(),
           /** a friend with an account (counts for their statistics) */
           userId: z.string().uuid().optional(),
+          /** voice for this player: pack id, null = standard voice, missing = automatic */
+          voicePackId: z.string().uuid().nullable().optional(),
         })
         .refine((p) => p.self || p.userId || p.name, 'Spielername fehlt'),
     )
     .min(1)
     .max(8),
   boardId: z.string().nullish(),
+  voiceMode: z.enum(['host', 'own']).optional(),
   /** abort my own running match on the board */
   force: z.boolean().optional(),
 });
@@ -360,10 +404,18 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
         (u) => [u.id, u.display_name],
       ),
     );
+    for (const packId of new Set(body.players.map((p) => p.voicePackId).filter((x): x is string => !!x))) {
+      if (!(await canUsePack(packId, user))) throw new HttpError(404, 'Stimmen-Paket nicht gefunden');
+    }
     const players: PlayerInfo[] = body.players.map((p, i) => {
       const uid = accountIds[i];
       if (uid && !names.has(uid)) throw new HttpError(404, 'Spieler nicht gefunden');
-      return { id: `p${i + 1}`, name: uid ? names.get(uid)! : p.name!, userId: uid };
+      return {
+        id: `p${i + 1}`,
+        name: uid ? names.get(uid)! : p.name!,
+        userId: uid,
+        ...(p.voicePackId !== undefined ? { voicePackId: p.voicePackId } : {}),
+      };
     });
 
     // a board hosts one match at a time
@@ -397,8 +449,8 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
         );
       }
       const res = await client.query<MatchRow>(
-        'INSERT INTO matches(owner_id, board_id, settings, players, voice_pack_id) VALUES ($1, $2, $3, $4, $5) RETURNING *',
-        [user, body.boardId ?? null, JSON.stringify(body.settings), JSON.stringify(players), await activePackOf(user)],
+        'INSERT INTO matches(owner_id, board_id, settings, players, voice_pack_id, voice_mode) VALUES ($1, $2, $3, $4, $5, $6) RETURNING *',
+        [user, body.boardId ?? null, JSON.stringify(body.settings), JSON.stringify(players), await activePackOf(user), body.voiceMode ?? 'host'],
       );
       row = res.rows[0];
       for (const [i, p] of players.entries()) {
@@ -428,13 +480,82 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
       sendToBoard(body.boardId, { type: 'command', action: 'reset' });
       await publishBoardStatus(body.boardId);
     }
-    const summary = toSummary(m.row, m.voice);
+    const summary = summaryOf(m);
     for (const p of players) {
       if (p.userId && p.userId !== user) {
         sendToUser(p.userId, { type: 'match_invite', match: summary, from: { id: user, displayName: m.ownerName } });
       }
     }
+    notifyFriends(user);
     return { match: summary, state: m.state, canControl: true };
+  });
+
+  /** Running matches of my friends (last 3 hours) that I am not part of - to watch or to join. */
+  app.get('/api/matches/friends', async (req) => {
+    const me = userId(req);
+    const friends = await friendIds(me);
+    if (!friends.length) return [];
+    const rows = await query<{ id: string; board_name: string | null }>(
+      `SELECT m.id, b.name AS board_name FROM matches m LEFT JOIN boards b ON b.id = m.board_id
+       WHERE m.status = 'running' AND m.owner_id = ANY($1::uuid[])
+         AND NOT EXISTS (SELECT 1 FROM match_players mp WHERE mp.match_id = m.id AND mp.user_id = $2)
+         AND COALESCE(to_timestamp((m.events->-1->>'at')::double precision / 1000), m.created_at) > now() - interval '3 hours'
+       ORDER BY m.created_at DESC LIMIT 20`,
+      [friends, me],
+    );
+    const out: FriendMatch[] = [];
+    for (const r of rows) {
+      const m = await load(r.id);
+      if (!m || m.row.status !== 'running') continue;
+      const blocked = joinBlocked(m);
+      out.push({
+        match: summaryOf(m),
+        ownerName: m.ownerName,
+        boardName: r.board_name,
+        joinable: !blocked,
+        joinBlocked: blocked,
+        round: m.state.round,
+        lastActivity: new Date(lastActivity(m)).toISOString(),
+      });
+    }
+    return out;
+  });
+
+  /** Join a friend's match as another player (only during the first round). */
+  app.post<{ Params: { id: string } }>('/api/matches/:id/join', async (req) => {
+    const user = userId(req);
+    const m = await load(req.params.id);
+    if (!m || !(await areFriends(m.row.owner_id, user))) throw new HttpError(404, 'Spiel nicht gefunden');
+    const [me] = await query<{ display_name: string }>('SELECT display_name FROM users WHERE id = $1', [user]);
+    if (!me) throw new HttpError(404, 'Konto nicht gefunden');
+    const joined = await locked(m, async () => {
+      if (m.row.players.some((p) => p.userId === user)) return false; // double click
+      const blocked = joinBlocked(m);
+      if (blocked) throw new HttpError(409, blocked);
+      const index = m.row.players.length;
+      const players: PlayerInfo[] = [...m.row.players, { id: `p${index + 1}`, name: me.display_name, userId: user }];
+      await query('UPDATE matches SET players = $2 WHERE id = $1', [m.row.id, JSON.stringify(players)]);
+      await query('INSERT INTO match_players(match_id, player_index, user_id) VALUES ($1, $2, $3)', [m.row.id, index, user]);
+      m.row = { ...m.row, players };
+      m.state = computeMatch(m.row.settings, players, m.row.events);
+      m.voices = await resolveVoices(players, m.row.voice_mode ?? 'host', m.voice).catch(() => players.map(() => m.voice));
+      publish(m);
+      return true;
+    });
+    if (joined) {
+      const notice: ServerToClient = {
+        type: 'match_joined',
+        matchId: m.row.id,
+        title: describeSettings(m.row.settings),
+        user: { id: user, displayName: me.display_name },
+      };
+      const others = new Set([m.row.owner_id, ...m.row.players.map((p) => p.userId).filter((x): x is string => !!x)]);
+      others.delete(user);
+      others.forEach((id) => sendToUser(id, notice));
+      notifyFriends(m.row.owner_id);
+      req.log.info({ match: m.row.id, user }, 'player joined');
+    }
+    return { match: summaryOf(m), state: m.state, canControl: true };
   });
 
   /**
@@ -469,7 +590,7 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
     await publishBoards(syncActive(m));
     if (boardId) sendToBoard(boardId, { type: 'command', action: 'reset' });
     req.log.info({ match: m.row.id, player: index, board: boardId }, 'player board changed');
-    return { match: toSummary(m.row, m.voice), state: m.state };
+    return { match: summaryOf(m), state: m.state };
   });
 
   app.get<{ Querystring: { status?: string; limit?: string } }>('/api/matches', async (req) => {
@@ -487,7 +608,7 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
 
   app.get<{ Params: { id: string } }>('/api/matches/:id', async (req) => {
     const m = await loadViewable(req.params.id, userId(req));
-    return { match: toSummary(m.row, m.voice), state: m.state, canControl: canControl(m, userId(req)) };
+    return { match: summaryOf(m), state: m.state, canControl: canControl(m, userId(req)) };
   });
 
   app.post<{ Params: { id: string } }>('/api/matches/:id/darts', async (req) => {
@@ -543,9 +664,11 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
 
 async function abortMatch(m: LiveMatch): Promise<void> {
   await query(`UPDATE matches SET status = 'aborted', finished_at = now() WHERE id = $1 AND status = 'running'`, [m.row.id]);
-  if (m.row.status === 'running') m.row = { ...m.row, status: 'aborted', finished_at: new Date() };
+  const wasRunning = m.row.status === 'running';
+  if (wasRunning) m.row = { ...m.row, status: 'aborted', finished_at: new Date() };
   await publishBoards(syncActive(m));
   publish(m);
+  if (wasRunning) notifyFriends(m.row.owner_id);
 }
 
 /** Matches nobody threw a dart in for STALE_MATCH_HOURS are ended automatically (no "match corpses"). */

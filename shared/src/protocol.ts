@@ -4,7 +4,7 @@
  */
 import type { Point, Segment } from './board';
 import type { MatchSettings, MatchState, PlayerInfo } from './match';
-import type { MatchVoice } from './voice';
+import type { MatchVoice, VoiceMode } from './voice';
 
 export type BoardState =
   | 'stopped'
@@ -61,7 +61,7 @@ export interface BoardStatus {
    * What the board client may do on request: reboot needs ALLOW_REBOOT + host D-Bus on the Pi,
    * update needs the auto-update container (profile "autoupdate") next to the board client.
    */
-  capabilities?: { restart: boolean; reboot: boolean; update?: boolean };
+  capabilities?: { restart: boolean; reboot: boolean; update?: boolean; autoCalibrate?: boolean };
 }
 
 export type BoardCommand = 'start' | 'stop' | 'reset' | 'rescan' | 'restart' | 'reboot' | 'update';
@@ -103,9 +103,23 @@ export type BoardToServer =
   | { type: 'takeout_finished' }
   | { type: 'frame'; camera: number; data: string; width: number; height: number; view?: StreamView }
   | { type: 'snapshot'; requestId: string; camera: number; data: string | null; width: number; height: number }
+  | { type: 'auto_calibration'; requestId: string; camera: number; result: AutoCalibration }
   | { type: 'calibration'; calibration: Record<string, CameraCalibration | null> }
   | { type: 'settings'; settings: BoardSettings }
   | { type: 'pong' };
+
+/** Result of the automatic calibration of one camera (proposal - saved only when the user confirms). */
+export interface AutoCalibration {
+  ok: boolean;
+  /** 5 normalised points like a manual calibration (also a best guess when ok is false) */
+  points: Point[] | null;
+  /** fit quality 0..1 */
+  score: number;
+  mode: 'refine' | 'full';
+  /** the board was found but not where the 20 is - the user has to tap on it */
+  needsHint: boolean;
+  message: string;
+}
 
 // ---------------------------------------------------------------- server -> board
 export type ServerToBoard =
@@ -120,6 +134,8 @@ export type ServerToBoard =
   /** raw: send camera images; front: cameras (indices) to send as frontal view. */
   | { type: 'stream'; enabled: boolean; fps: number; maxWidth: number; raw: boolean; front: number[] }
   | { type: 'snapshot_request'; requestId: string; camera: number }
+  /** find the board in the camera image; prior = rough/old points, hint20 = tap on the 20 */
+  | { type: 'auto_calibrate'; requestId: string; camera: number; prior?: Point[] | null; hint20?: Point | null }
   | { type: 'set_calibration'; camera: number; calibration: CameraCalibration | null }
   | { type: 'command'; action: BoardCommand }
   | { type: 'set_settings'; settings: Partial<BoardSettings> }
@@ -148,6 +164,22 @@ export interface MatchSummary {
   finishedAt: string | null;
   /** Voice pack of the player who created the match (null = standard voice). */
   voice?: MatchVoice | null;
+  voiceMode?: VoiceMode;
+  /** Voice per player (index = player), resolved by the server. Missing = use `voice`. */
+  voices?: (MatchVoice | null)[];
+}
+
+/** A running match of a friend (shown as a suggestion, you can watch or join). */
+export interface FriendMatch {
+  match: MatchSummary;
+  ownerName: string;
+  boardName: string | null;
+  /** players can still join (first round of the first leg) */
+  joinable: boolean;
+  /** why joining is not possible any more */
+  joinBlocked: string | null;
+  round: number;
+  lastActivity: string;
 }
 
 /** The running match that currently occupies a board. */
@@ -219,5 +251,9 @@ export type ServerToClient =
   | { type: 'friends_changed' }
   /** Somebody added me as a player to a new match. */
   | { type: 'match_invite'; match: MatchSummary; from: { id: string; displayName: string } }
+  /** somebody joined one of my matches */
+  | { type: 'match_joined'; matchId: string; title: string; user: { id: string; displayName: string } }
+  /** a friend started, joined or ended a match – reload the suggestions */
+  | { type: 'friend_matches' }
   | { type: 'pong' }
   | { type: 'error'; message: string };

@@ -1,13 +1,16 @@
 """Dart detection from 1..n calibrated cameras.
 
-Pipeline per evaluation (after the image has calmed down):
-  1. difference image against the reference (board before the throw)
+Motion / calm detection runs on every frame on grey images scaled down to PROC_WIDTH (cheap).
+Pipeline per evaluation (once per dart, after the image has calmed down):
+  1. difference image against the reference (board before the throw), small images
   2. the new dart is the largest changed blob inside the board region
-  3. the dart axis is fitted on the tip-side part of the blob
+  3. the axis is fitted on the full resolution frames around that blob (the reference is kept in
+     full resolution too): tip-side part of the blob (flight removed), centres of its 1 px cross
+     sections, cross sections next to older darts (partly hidden) are skipped
   4. via the calibration homography the image axis is mapped onto the board plane:
      the dart tip is guaranteed to lie on this board line (it is the intersection of the
      dart with the board plane), even if the thin steel tip itself is not visible
-  5. the board lines of all cameras are intersected (least squares) -> tip position
+  5. the board lines of all cameras are intersected (pairwise consensus + least squares) -> tip position
 """
 from __future__ import annotations
 
@@ -26,7 +29,12 @@ from .geometry import BOARD_RADIUS, apply_h, board_to_image_homography, circle_p
 
 log = logging.getLogger(__name__)
 
-PROC_WIDTH = 640
+PROC_WIDTH = 640  # motion / calm detection and the decisions (areas) run on this image width
+# Normalised calibration points are image positions in edge coordinates (as the app places them on the
+# picture: 0 = left edge of the first pixel, 1 = right edge of the last one). OpenCV pixel centres are
+# integers, so a normalised x maps to x * width - 0.5.
+CALIB_ORIGIN = 0.5
+FULL_BLUR = 3  # Gaussian kernel for the full resolution dart analysis
 
 
 @dataclass
@@ -40,6 +48,21 @@ class Observation:
     weight: float
 
 
+def _homography(points: list[tuple[float, float]], w: int, h: int) -> np.ndarray | None:
+    """Board mm -> OpenCV pixel coordinates of a w x h image."""
+    H = board_to_image_homography(points, w, h)
+    if H is None:
+        return None
+    return np.array([[1.0, 0, -CALIB_ORIGIN], [0, 1.0, -CALIB_ORIGIN], [0, 0, 1.0]]) @ H
+
+
+def _pose(H: np.ndarray, w: int, h: int):
+    try:
+        return estimate_pose(H, w, h)
+    except Exception:  # degenerate calibration
+        return None
+
+
 class CameraState:
     def __init__(self, index: int, points: list[tuple[float, float]]):
         self.index = index
@@ -48,47 +71,62 @@ class CameraState:
         self.H: np.ndarray | None = None  # board -> proc image
         self.Hinv: np.ndarray | None = None
         self.pose: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
+        # the same for the full resolution frames (dart analysis)
+        self.full_size: tuple[int, int] | None = None
+        self.Hf: np.ndarray | None = None
+        self.Hfinv: np.ndarray | None = None
+        self.posef: tuple[np.ndarray, np.ndarray, np.ndarray] | None = None
         self.roi: np.ndarray | None = None
         self.ref: np.ndarray | None = None
+        self.ref_full: np.ndarray | None = None  # full resolution grey image of the reference
         self.prev: np.ndarray | None = None
         self.empty: np.ndarray | None = None
+        self.empty_full: np.ndarray | None = None  # full resolution board without darts (after a takeout)
 
-    def normal_direction(self, img_pt: np.ndarray) -> np.ndarray | None:
+    def normal_direction(self, img_pt: np.ndarray, full: bool = False) -> np.ndarray | None:
         """Image direction in which a dart standing at img_pt points away from the board."""
-        if self.pose is None:
+        pose, Hinv = (self.posef, self.Hfinv) if full else (self.pose, self.Hinv)
+        if pose is None:
             return None
-        b = apply_h(self.Hinv, [img_pt])[0]
-        K, R, t = self.pose
+        b = apply_h(Hinv, [img_pt])[0]
+        K, R, t = pose
         p = project3d(K, R, t, [[b[0], b[1], 0.0], [b[0], b[1], 40.0]])
         d = p[1] - p[0]
         n = float(np.linalg.norm(d))
         return d / n if n > 1e-6 else None
 
-    def prepare(self, w: int, h: int) -> bool:
-        if self.size == (w, h) and self.H is not None:
+    def prepare(self, w: int, h: int, fw: int | None = None, fh: int | None = None) -> bool:
+        fw, fh = fw or w, fh or h
+        if self.size == (w, h) and self.full_size == (fw, fh) and self.H is not None:
             return True
-        H = board_to_image_homography(self.points, w, h)
-        if H is None:
+        H = _homography(self.points, w, h)
+        Hf = _homography(self.points, fw, fh)
+        if H is None or Hf is None:
             return False
-        self.size = (w, h)
-        self.H = H
-        self.Hinv = np.linalg.inv(H)
-        try:
-            self.pose = estimate_pose(H, w, h)
-        except Exception:  # degenerate calibration
-            self.pose = None
+        self.size, self.full_size = (w, h), (fw, fh)
+        self.H, self.Hf = H, Hf
+        self.Hinv, self.Hfinv = np.linalg.inv(H), np.linalg.inv(Hf)
+        self.pose, self.posef = _pose(H, w, h), _pose(Hf, fw, fh)
         outline = apply_h(H, circle_points(BOARD_RADIUS * 1.04, 96)).astype(np.int32)
         roi = np.zeros((h, w), np.uint8)
         cv2.fillPoly(roi, [outline], 255)
         # darts stick out of the board towards the camera -> grow the region generously
         k = max(15, int(h * 0.22)) | 1
         self.roi = cv2.dilate(roi, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
-        self.ref = self.prev = self.empty = None
+        self.ref = self.prev = self.empty = self.ref_full = self.empty_full = None
         return True
 
+    @property
+    def scaled(self) -> bool:
+        """The full resolution frames are bigger than the processing images."""
+        return self.full_size is not None and self.full_size != self.size
 
-def _to_gray(frame: np.ndarray, width: int) -> np.ndarray:
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+def _gray(frame: np.ndarray) -> np.ndarray:
+    return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+
+
+def _shrink(gray: np.ndarray, width: int) -> np.ndarray:
     h, w = gray.shape[:2]
     if w != width:
         gray = cv2.resize(gray, (width, int(round(h * width / w))), interpolation=cv2.INTER_AREA)
@@ -123,7 +161,7 @@ class Detector:
     def reset(self) -> None:
         with self._lock:
             for c in self.cams.values():
-                c.ref = c.prev = c.empty = None
+                c.ref = c.prev = c.empty = c.ref_full = c.empty_full = None
             self.darts = 0
             self.state = "throw"
             self.moving = False
@@ -157,16 +195,20 @@ class Detector:
         s = self.settings
         events: list[tuple] = []
         grays: dict[int, np.ndarray] = {}
+        fulls: dict[int, np.ndarray] = {}  # full resolution grey frames, only used for the dart analysis
         for idx, cam in self.cams.items():
             frame = frames.get(idx)
             if frame is None:
                 continue
-            g = _to_gray(frame, min(PROC_WIDTH, frame.shape[1]))
-            if not cam.prepare(g.shape[1], g.shape[0]):
+            full = _gray(frame)
+            g = _shrink(full, min(PROC_WIDTH, full.shape[1]))
+            if not cam.prepare(g.shape[1], g.shape[0], full.shape[1], full.shape[0]):
                 continue
             grays[idx] = g
+            fulls[idx] = full
             if cam.ref is None:
                 cam.ref = cam.prev = cam.empty = g
+                cam.ref_full = cam.empty_full = full
         if not grays or not self.detecting:
             for idx, g in grays.items():
                 self.cams[idx].prev = g
@@ -178,6 +220,9 @@ class Detector:
             for idx, g in grays.items():
                 cam = self.cams[idx]
                 cam.ref = cam.prev = g
+                cam.ref_full = fulls[idx]
+                if self.darts == 0 and self.state == "throw":  # no darts in the board: new empty image
+                    cam.empty, cam.empty_full = g, fulls[idx]
             self.moving = False
             self.calm = 0
             if self.state == "takeout_in_progress" and self._pre_takeout:
@@ -214,7 +259,7 @@ class Detector:
             return events
         self.moving = False
         self.calm = 0
-        self._evaluate(grays, events)
+        self._evaluate(grays, fulls, events)
         return events
 
     def _lighting(self, grays: dict[int, np.ndarray]) -> bool:
@@ -249,7 +294,10 @@ class Detector:
         cam = self.cams[idx]
         mask = (cv2.absdiff(g, ref) > self.settings.diffThreshold).astype(np.uint8) * 255
         mask = cv2.bitwise_and(mask, cam.roi)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+        # opening with a 2x2 square (removes single pixels). MORPH_OPEN with an even kernel would
+        # shift the whole mask by one pixel (= ~1.5 mm on the board), mirrored anchors keep it in place.
+        k = np.ones((2, 2), np.uint8)
+        mask = cv2.dilate(cv2.erode(mask, k, anchor=(0, 0)), k, anchor=(1, 1))
         return mask
 
     def _change_area(self, idx: int, g: np.ndarray, ref: np.ndarray | None) -> int:
@@ -271,13 +319,15 @@ class Detector:
         events.append(("takeout_started",))
         events.append(("state",))
 
-    def _set_refs(self, grays: dict[int, np.ndarray], empty: bool = False) -> None:
+    def _set_refs(self, grays: dict[int, np.ndarray], fulls: dict[int, np.ndarray], empty: bool = False) -> None:
         for idx, g in grays.items():
             self.cams[idx].ref = g
+            self.cams[idx].ref_full = fulls.get(idx)
             if empty:
                 self.cams[idx].empty = g
+                self.cams[idx].empty_full = fulls.get(idx)
 
-    def _evaluate(self, grays: dict[int, np.ndarray], events: list[tuple]) -> None:
+    def _evaluate(self, grays: dict[int, np.ndarray], fulls: dict[int, np.ndarray], events: list[tuple]) -> None:
         s = self.settings
         masks = {i: self._diff_mask(i, g, self.cams[i].ref) for i, g in grays.items()}
         areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
@@ -300,28 +350,30 @@ class Detector:
             self.darts = 0
             self.state = "throw"
             self._pre_takeout = None
-            self._set_refs(grays, empty=True)
+            self._set_refs(grays, fulls, empty=True)
             events.append(("takeout_finished",))
             events.append(("state",))
             return
 
         if max(areas.values()) < s.minDartArea:
-            self._set_refs(grays)  # noise / slow light change
+            self._set_refs(grays, fulls)  # noise / slow light change
             return
 
         if self.state == "takeout":
-            self._set_refs(grays)  # more than three darts: ignore
+            self._set_refs(grays, fulls)  # more than three darts: ignore
             return
 
         observations = []
+        # At least one camera saw a dart. Far from a camera a dart is small in its image (often just
+        # below minDartArea), but every additional view makes the intersection much more stable.
         for idx, mask in masks.items():
-            if areas[idx] < s.minDartArea:
+            if areas[idx] < max(8, s.minDartArea // 3):
                 continue
-            obs = self._analyze(idx, mask)
+            obs = self._analyze(idx, mask, fulls.get(idx))
             if obs is not None:
                 observations.append(obs)
         result = fuse(observations)
-        self._set_refs(grays)
+        self._set_refs(grays, fulls)
         if result is None:
             log.info("change detected but no dart found (areas %s)", areas)
             return
@@ -330,8 +382,8 @@ class Detector:
         tips = {}
         for idx in cams:
             cam = self.cams[idx]
-            p = apply_h(cam.H, [[x, y]])[0]
-            tips[idx] = {"x": float(p[0] / cam.size[0]), "y": float(p[1] / cam.size[1])}
+            p = apply_h(cam.Hf, [[x, y]])[0] + CALIB_ORIGIN
+            tips[idx] = {"x": float(p[0] / cam.full_size[0]), "y": float(p[1] / cam.full_size[1])}
         self.darts += 1
         if self.darts >= 3:
             self.state = "takeout"
@@ -352,8 +404,39 @@ class Detector:
         )
         events.append(("state",))
 
-    def _analyze(self, idx: int, mask: np.ndarray) -> Observation | None:
+    def _analyze(self, idx: int, mask: np.ndarray, full: np.ndarray | None = None) -> Observation | None:
         cam = self.cams[idx]
+        blob = self._dart_blob(cam, mask)
+        if blob is None:
+            return None
+        ys, xs = np.nonzero(blob)
+        if len(xs) < max(8, self.settings.minDartArea // 3):
+            return None
+        pts = np.column_stack([xs, ys]).astype(np.float64)
+        mean = pts.mean(axis=0)
+        evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+        v = evecs[:, 1]
+        t = (pts - mean) @ v
+        length = float(t.max() - t.min())
+        area = len(xs)
+        # The blob was found in the small processing image, the axis is fitted on the full resolution
+        # frames: a triple/double ring is only 2-3 px tall there, a one pixel error is ~1.5 mm on the board.
+        if length >= 5 and full is not None and cam.scaled and cam.ref_full is not None and cam.ref_full.shape == full.shape:
+            fpts, occ = self._full_points(cam, blob, xs, ys, full)
+            if fpts is not None:
+                s = cam.full_size[0] / cam.size[0]
+                fm = fpts.mean(axis=0)
+                fv = np.linalg.eigh(np.cov((fpts - fm).T))[1][:, 1]
+                ft = (fpts - fm) @ fv
+                if float(ft.max() - ft.min()) < 6 * s:
+                    return None
+                return self._fit(cam, fpts, s, True, length, area, occ)
+        if length < 10:
+            return None
+        return self._fit(cam, pts, 1.0, False, length, area)
+
+    def _dart_blob(self, cam: CameraState, mask: np.ndarray) -> np.ndarray | None:
+        """The new dart in the change mask (bool image), or None."""
         # The dart often falls apart into pieces (dark shaft on a dark board gives no difference):
         # start with the biggest blob and grow it by nearby fragments.
         n, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -393,49 +476,82 @@ class Detector:
         for i in comps:
             clusters.setdefault(find(i), []).append(i)
         members = max(clusters.values(), key=lambda m: sum(int(stats[i, cv2.CC_STAT_AREA]) for i in m))
-        blob = np.isin(labels, members)
-        ys, xs = np.nonzero(blob)
-        if len(xs) < max(8, self.settings.minDartArea // 3):
-            return None
-        pts = np.column_stack([xs, ys]).astype(np.float64)
-        mean = pts.mean(axis=0)
-        cov = np.cov((pts - mean).T)
-        evals, evecs = np.linalg.eigh(cov)
-        v = evecs[:, 1]
-        t = (pts - mean) @ v
-        length = float(t.max() - t.min())
-        if length < 10:
-            return None
+        return np.isin(labels, members)
 
+    def _full_points(
+        self, cam: CameraState, blob: np.ndarray, xs: np.ndarray, ys: np.ndarray, full: np.ndarray
+    ) -> tuple[np.ndarray | None, tuple[np.ndarray, int, int] | None]:
+        """Changed pixels of the full resolution frame around the blob (x, y in full resolution pixels),
+        plus a mask of the older darts in that region (mask, x0, y0) if the empty board is known."""
+        (w, h), (fw, fh) = cam.size, cam.full_size
+        sx, sy = fw / w, fh / h
+        pad = 3
+        px0, px1 = max(0, int(xs.min()) - pad), min(w, int(xs.max()) + 1 + pad)
+        py0, py1 = max(0, int(ys.min()) - pad), min(h, int(ys.max()) + 1 + pad)
+        x0, x1 = int(round(px0 * sx)), min(fw, int(round(px1 * sx)))
+        y0, y1 = int(round(py0 * sy)), min(fh, int(round(py1 * sy)))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return None, None
+        # the blob of the small image is blurred (wider than the dart): a small margin is enough
+        near = cv2.dilate(blob[py0:py1, px0:px1].astype(np.uint8), np.ones((3, 3), np.uint8))
+        near = cv2.resize(near, (x1 - x0, y1 - y0), interpolation=cv2.INTER_NEAREST)
+        k = (FULL_BLUR, FULL_BLUR)
+        cur = cv2.GaussianBlur(full[y0:y1, x0:x1], k, 0)
+        ref = cv2.GaussianBlur(cam.ref_full[y0:y1, x0:x1], k, 0)
+        thr = self.settings.diffThreshold
+        changed = (cv2.absdiff(cur, ref) > thr) & (near > 0)
+        fy, fx = np.nonzero(changed)
+        if len(fx) < max(8, self.settings.minDartArea // 3) * sx * sy:
+            return None, None
+        occ = None
+        if cam.empty_full is not None and cam.empty_full.shape == full.shape:
+            # darts thrown before this one: in the reference, but not on the empty board
+            empty = cv2.GaussianBlur(cam.empty_full[y0:y1, x0:x1], k, 0)
+            old = (cv2.absdiff(ref, empty) > thr).astype(np.uint8)
+            occ = (cv2.dilate(old, np.ones((3, 3), np.uint8)) > 0, x0, y0)
+        return np.column_stack([fx + x0, fy + y0]).astype(np.float64), occ
+
+    def _fit(
+        self, cam: CameraState, pts: np.ndarray, s: float, full: bool, length: float, area: int,
+        occ: tuple[np.ndarray, int, int] | None = None,
+    ) -> Observation | None:
+        """Fit the dart axis on the blob points (pixels of a 1/s scaled processing image) -> board line."""
+        idx = cam.index
+        Hinv = cam.Hfinv if full else cam.Hinv
+        mean = pts.mean(axis=0)
         # 1) initial axis, oriented from the tip towards the flight
-        dn = cam.normal_direction(mean)
+        dn = cam.normal_direction(mean, full)
         if dn is not None:
             away = dn  # darts stand roughly perpendicular on the board
         else:
+            evals, evecs = np.linalg.eigh(np.cov((pts - mean).T))
+            v = evecs[:, 1]
+            t = (pts - mean) @ v
             perp = (pts - mean) @ np.array([-v[1], v[0]])
-            band = 0.18 * length
+            band = 0.18 * float(t.max() - t.min())
             w_min = float(perp[t < t.min() + band].std())
             w_max = float(perp[t > t.max() - band].std())
             away = v if w_min <= w_max else -v  # the flight end is the wide one
 
         # 2) remove the (wide) flight, keep point + barrel (+ shaft) for the axis fit
-        thin, flight = _split_flight(pts, mean, away)
-        if len(thin) >= 10:
+        thin, flight = _split_flight(pts, mean, away, s)
+        if len(thin) >= 10 * s * s:
             vx, vy, x0, y0 = cv2.fitLine(thin.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
             d = np.array([vx, vy], dtype=np.float64)
             p0 = np.array([x0, y0], dtype=np.float64)
             if d @ away < 0:
                 d = -d
+            p0, d = _slice_axis(thin, p0, d, occ)
             proj = (thin - p0) @ d
             extent = float(proj.max() - proj.min())
-            near = thin[proj < proj.min() + 1.5]
+            near = thin[proj < proj.min() + 1.5 * s]
             tip_img = p0 + d * float(((near - p0) @ d).mean())
             # thin part: reliable direction; if the flight is visible too, the axis must pass through it
-            weight = min(1.0, extent / 35.0)
-            if len(flight) >= 10:
+            weight = min(1.0, extent / (35.0 * s))
+            if len(flight) >= 10 * s * s:
                 fc = flight.mean(axis=0)
                 off = abs(float((fc - p0) @ np.array([-d[1], d[0]])))
-                if off > 6:
+                if off > 6 * s:
                     weight *= 0.5
         else:
             # only the flight is visible: assume the dart is perpendicular to the board
@@ -444,35 +560,79 @@ class Detector:
             d = dn
             proj = (pts - mean) @ d
             tip_img = mean + d * float(proj.min())
-            extent = length
+            extent = length * s
             weight = 0.08
-        far_img = tip_img + d * max(25.0, extent)
-        tip_b, far_b = apply_h(cam.Hinv, [tip_img, far_img])
+        # small blobs (far away, mostly hidden) give wrong lines much more often
+        weight *= min(1.0, max(0.4, area / (1.5 * self.settings.minDartArea)))
+        far_img = tip_img + d * max(25.0 * s, extent)
+        tip_b, far_b = apply_h(Hinv, [tip_img, far_img])
         u = far_b - tip_b
         norm = float(np.linalg.norm(u))
         if norm < 1e-6:
             return None
         u /= norm
         normal = np.array([-u[1], u[0]])
-        return Observation(idx, tip_b, normal, float(normal @ tip_b), length, len(xs), max(weight, 0.05))
+        return Observation(idx, tip_b, normal, float(normal @ tip_b), length, area, max(weight, 0.05))
 
 
-def _split_flight(pts: np.ndarray, mean: np.ndarray, away: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Split blob points into the thin part (point/barrel/shaft) and the wide flight."""
+def _slice_axis(pts: np.ndarray, p0: np.ndarray, d: np.ndarray, occ: tuple[np.ndarray, int, int] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """Refine an axis (p0, d): robust line through the centres of 1 px wide cross sections of the dart.
+
+    The centre between both edges is independent of how many pixels of a cross section pass the
+    threshold inside (a dark shaft in front of a dark segment). Cross sections with an edge next to
+    an older dart (occ) are skipped: there the new dart is partly hidden behind it or invisible in
+    front of it, so its centre would be shifted.
+    """
+    n = np.array([-d[1], d[0]])
+    t = (pts - p0) @ d
+    q = (pts - p0) @ n
+    b = np.floor(t - t.min()).astype(int)
+    nb = int(b.max()) + 1
+    cnt = np.bincount(b, minlength=nb)
+    ok = cnt > 0
+    lo = np.full(nb, np.inf)
+    hi = np.full(nb, -np.inf)
+    np.minimum.at(lo, b, q)
+    np.maximum.at(hi, b, q)
+    tc = np.bincount(b, t, nb) / np.maximum(cnt, 1)
+    mid = np.zeros(nb)
+    mid[ok] = (lo[ok] + hi[ok]) / 2
+    if occ is not None:
+        mask, ox, oy = occ
+        hidden = np.zeros(nb, bool)
+        for edge in (lo - 2.0, hi + 2.0):  # the pixel just outside each edge
+            e = np.where(ok, edge, 0.0)
+            px = np.rint(p0[0] + tc * d[0] + e * n[0]).astype(int) - ox
+            py = np.rint(p0[1] + tc * d[1] + e * n[1]).astype(int) - oy
+            inside = ok & (px >= 0) & (py >= 0) & (px < mask.shape[1]) & (py < mask.shape[0])
+            hidden[inside] |= mask[py[inside], px[inside]]
+        clear = ok & ~hidden
+        if clear.sum() >= max(6, 0.4 * ok.sum()):
+            ok = clear
+    if ok.sum() < 4:
+        return p0, d
+    centres = p0 + np.outer(tc[ok], d) + np.outer(mid[ok], n)
+    vx, vy, x0, y0 = cv2.fitLine(centres.astype(np.float32), cv2.DIST_HUBER, 0, 0.01, 0.01).ravel()
+    d2 = np.array([vx, vy], dtype=np.float64)
+    return np.array([x0, y0], dtype=np.float64), (d2 if d2 @ d >= 0 else -d2)
+
+
+def _split_flight(pts: np.ndarray, mean: np.ndarray, away: np.ndarray, s: float = 1.0) -> tuple[np.ndarray, np.ndarray]:
+    """Split blob points into the thin part (point/barrel/shaft) and the wide flight (s = pixel scale)."""
     perp_dir = np.array([-away[1], away[0]])
     t = (pts - mean) @ away
-    s = (pts - mean) @ perp_dir
+    q = (pts - mean) @ perp_dir
     t0 = t.min()
-    bins = ((t - t0) // 3).astype(int)
+    bins = ((t - t0) // (3 * s)).astype(int)
     nb = int(bins.max()) + 1
     lo = np.full(nb, np.inf)
     hi = np.full(nb, -np.inf)
-    np.minimum.at(lo, bins, s)
-    np.maximum.at(hi, bins, s)
+    np.minimum.at(lo, bins, q)
+    np.maximum.at(hi, bins, q)
     filled = np.isfinite(lo)
     width = np.where(filled, hi - lo + 1, 0)
     ref = np.percentile(width[filled], 30) if np.any(filled) else 1
-    wide = width > max(7.0, 2.5 * ref)
+    wide = width > max(7.0 * s, 2.5 * ref)
     if not np.any(wide):
         return pts, pts[:0]
     first_wide = int(np.argmax(wide))
@@ -486,6 +646,15 @@ def _intersect(a: Observation, b: Observation) -> np.ndarray | None:
     if abs(float(np.linalg.det(A))) < 0.08:  # lines (almost) parallel
         return None
     return np.linalg.solve(A, np.array([a.offset, b.offset]))
+
+
+INLIER_MM = 5.0  # max. distance of a board line from the intersection
+TIP_BEHIND_MM = 6.0  # the visible tip can be hidden (further along the line), but not in front of the intersection
+
+
+def _behind(o: Observation, X: np.ndarray) -> float:
+    """Distance of the visible tip from X along the board line, positive = away from the camera."""
+    return float((o.tip_board - X) @ np.array([o.normal[1], -o.normal[0]]))
 
 
 def fuse(obs: list[Observation]) -> tuple[float, float, list[int], float] | None:
@@ -502,8 +671,14 @@ def fuse(obs: list[Observation]) -> tuple[float, float, list[int], float] | None
             X = _intersect(a, b)
             if X is None or math.hypot(*X) > BOARD_RADIUS + 40:
                 continue
-            inliers = [o for o in obs if abs(float(o.normal @ X - o.offset)) < 5.0]
-            score_ = (sum(o.weight for o in inliers), a.weight + b.weight)
+            # the image of a dart starts at its tip: a line whose visible tip lies clearly in front of X
+            # (towards its camera) does not belong to a dart at X
+            inliers = [o for o in obs if abs(float(o.normal @ X - o.offset)) < INLIER_MM and _behind(o, X) > -TIP_BEHIND_MM]
+            if not inliers:
+                inliers = [a, b]
+            # ties (three lines, one of them wrong: every pair has two inliers) -> the better conditioned pair
+            angle = abs(float(np.linalg.det(np.array([a.normal, b.normal]))))
+            score_ = (round(sum(o.weight for o in inliers), 6), round(a.weight + b.weight, 6), angle)
             if best is None or score_ > best[0]:
                 best = (score_, X, inliers)
     if best is None:

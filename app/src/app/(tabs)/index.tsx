@@ -11,7 +11,9 @@ import {
   type MatchSettings,
   type MatchState,
   type MatchSummary,
+  type VoiceMode,
 } from '@shared';
+import { FriendMatches } from '@/components/FriendMatches';
 import { OnlineDot } from '@/components/OnlineDot';
 import { Badge, Button, Card, ErrorText, H2, P, Row, Screen, Segmented, Stepper, styles as ui } from '@/components/ui';
 import { ApiError, api, errorMessage } from '@/lib/api';
@@ -23,6 +25,7 @@ import { useBoards, useRunningMatches } from '@/lib/hooks';
 import { live, useLiveMessages } from '@/lib/live';
 import { getItem, setItem } from '@/lib/storage';
 import { colors, radius } from '@/lib/theme';
+import { useVoicePacks } from '@/lib/voice';
 
 type Mode = '301' | '501' | 'cricket' | 'atc';
 
@@ -32,7 +35,12 @@ interface PlayerDraft {
   self: boolean;
   /** friend with an account */
   userId?: string;
+  /** voice for this player: pack id, null = standard voice, undefined = automatic */
+  voice?: string | null;
 }
+
+/** Key under which a player's voice choice is remembered for the next match. */
+const voiceSlot = (p: PlayerDraft) => (p.self ? 'self' : p.userId ? `u:${p.userId}` : `g:${p.name}`);
 
 const LAST_SETUP_KEY = 'autodarter.lastSetup';
 
@@ -52,6 +60,7 @@ export default function PlayScreen() {
   const boards = useBoards();
   const running = useRunningMatches();
   const friends = useFriends();
+  const voicePacks = useVoicePacks();
   const [mode, setMode] = useState<Mode>('301');
   const [inMode, setInMode] = useState<InOutMode>('straight');
   const [outMode, setOutMode] = useState<InOutMode>('double');
@@ -71,6 +80,9 @@ export default function PlayScreen() {
   const [error, setError] = useState<string | null>(null);
   const [busyInfo, setBusyInfo] = useState<BoardActiveMatch | null>(null);
   const [busy, setBusy] = useState(false);
+  const [voiceMode, setVoiceMode] = useState<VoiceMode>('own');
+  /** player whose voice picker is open */
+  const [voiceOpen, setVoiceOpen] = useState<string | null>(null);
 
   // restore the last setup (game options and players – the board is chosen automatically)
   useEffect(() => {
@@ -88,14 +100,19 @@ export default function PlayScreen() {
         if (typeof s.atcSkip === 'boolean') setAtcSkip(s.atcSkip);
         if (typeof s.atcBull === 'boolean') setAtcBull(s.atcBull);
         if (typeof s.boardId === 'string') lastBoard.current = s.boardId;
+        if (s.voiceMode === 'own' || s.voiceMode === 'host') setVoiceMode(s.voiceMode);
+        const voices: Record<string, string | null> = s.voices && typeof s.voices === 'object' ? s.voices : {};
+        const withVoice = (d: PlayerDraft): PlayerDraft => (voiceSlot(d) in voices ? { ...d, voice: voices[voiceSlot(d)] } : d);
         const restored: PlayerDraft[] = [];
         if (Array.isArray(s.guests)) {
-          s.guests.forEach((g: string, i: number) => restored.push({ key: `g${i}${g}`, name: g, self: false }));
+          s.guests.forEach((g: string, i: number) => restored.push(withVoice({ key: `g${i}${g}`, name: g, self: false })));
         }
         if (Array.isArray(s.friends)) {
-          s.friends.forEach((f: { userId: string; name: string }) => restored.push({ key: `f${f.userId}`, name: f.name, self: false, userId: f.userId }));
+          s.friends.forEach((f: { userId: string; name: string }) =>
+            restored.push(withVoice({ key: `f${f.userId}`, name: f.name, self: false, userId: f.userId })),
+          );
         }
-        if (restored.length) setPlayers((p) => [...p.filter((x) => x.self), ...restored].slice(0, 8));
+        setPlayers((p) => [...p.filter((x) => x.self).map(withVoice), ...restored].slice(0, 8));
       } catch {
         // ignore
       }
@@ -169,8 +186,12 @@ export default function PlayScreen() {
       const res = await api<{ match: MatchSummary; state: MatchState }>('/api/matches', {
         body: {
           settings,
-          players: players.map((p) => (p.self ? { self: true } : p.userId ? { userId: p.userId } : { name: p.name })),
+          players: players.map((p) => ({
+            ...(p.self ? { self: true } : p.userId ? { userId: p.userId } : { name: p.name }),
+            ...(chosenVoice(p) !== undefined ? { voicePackId: chosenVoice(p) } : {}),
+          })),
           boardId: boardId ?? null,
+          voiceMode,
           force,
         },
       });
@@ -187,6 +208,8 @@ export default function PlayScreen() {
           atcSkip,
           atcBull,
           boardId,
+          voiceMode,
+          voices: Object.fromEntries(players.filter((p) => chosenVoice(p) !== undefined).map((p) => [voiceSlot(p), chosenVoice(p)])),
           guests: players.filter((p) => !p.self && !p.userId).map((p) => p.name),
           friends: players.filter((p) => p.userId).map((p) => ({ userId: p.userId, name: p.name })),
         }),
@@ -217,6 +240,24 @@ export default function PlayScreen() {
   ];
 
   const selectedBoard = boards.data?.find((b) => b.id === boardId);
+  const packs = voicePacks.data?.packs ?? [];
+  const packName = (id: string) => packs.find((x) => x.id === id)?.name ?? null;
+  const myVoice = voicePacks.data?.activeId ? (packName(voicePacks.data.activeId) ?? 'Standardstimme') : 'Standardstimme';
+  /** The player's chosen voice; a pack that is gone (deleted, no longer shared, other account) counts as automatic. */
+  const chosenVoice = (p: PlayerDraft): string | null | undefined =>
+    p.voice && voicePacks.data && !packName(p.voice) ? undefined : p.voice;
+  /** What the player will sound like (shown under the name). */
+  const voiceText = (p: PlayerDraft): string => {
+    const v = chosenVoice(p);
+    if (v === null) return 'Standardstimme';
+    if (v) return packName(v) ?? 'Eigenes Paket';
+    if (voiceMode === 'own' && p.userId) return 'Auto · eigene Stimme aus dem Profil';
+    return `Auto · ${myVoice}`;
+  };
+  const setVoice = (key: string, voice: string | null | undefined) => {
+    setPlayers((list) => list.map((x) => (x.key === key ? { ...x, voice } : x)));
+    setVoiceOpen(null);
+  };
   const inGame = new Set(players.map((p) => p.userId).filter(Boolean));
   const available = friends.friends.filter((f) => !inGame.has(f.id));
   const suggested = available.filter((f) => f.online);
@@ -224,6 +265,7 @@ export default function PlayScreen() {
 
   return (
     <Screen>
+      <FriendMatches />
       {running.data && running.data.length > 0 ? (
         <Card>
           <H2>Laufende Spiele</H2>
@@ -332,16 +374,63 @@ export default function PlayScreen() {
             ) : (
               <Ionicons name={p.self ? 'person' : 'person-outline'} size={18} color={p.self ? colors.accent : colors.muted} />
             )}
-            <Text style={{ color: colors.text, flex: 1, fontWeight: '600' }}>
-              {p.name}
-              {p.self ? '  (du)' : p.userId ? '' : '  (Gast)'}
-            </Text>
+            <View style={{ flex: 1, gap: 2 }}>
+              <Text style={{ color: colors.text, fontWeight: '600' }}>
+                {p.name}
+                {p.self ? '  (du)' : p.userId ? '' : '  (Gast)'}
+              </Text>
+              <Pressable
+                onPress={() => setVoiceOpen(voiceOpen === p.key ? null : p.key)}
+                accessibilityRole="button"
+                accessibilityLabel={`Stimme für ${p.name}: ${voiceText(p)}`}
+                style={{ flexDirection: 'row', alignItems: 'center', gap: 4, alignSelf: 'flex-start' }}
+              >
+                <Ionicons name="volume-medium" size={13} color={chosenVoice(p) !== undefined ? colors.accent : colors.faint} />
+                <Text style={{ color: chosenVoice(p) !== undefined ? colors.accent : colors.faint, fontSize: 12 }}>{voiceText(p)}</Text>
+                <Ionicons name={voiceOpen === p.key ? 'chevron-up' : 'chevron-down'} size={12} color={colors.faint} />
+              </Pressable>
+              {voiceOpen === p.key ? (
+                <View style={{ flexDirection: 'row', flexWrap: 'wrap', gap: 6, paddingTop: 4 }}>
+                  {[
+                    { id: undefined, label: 'Automatisch' },
+                    { id: null, label: 'Standardstimme' },
+                    ...packs.map((x) => ({ id: x.id, label: x.mine ? x.name : `${x.name} (${x.ownerName})` })),
+                  ].map((o) => {
+                    const active = chosenVoice(p) === o.id;
+                    return (
+                      <Pressable
+                        key={String(o.id)}
+                        onPress={() => setVoice(p.key, o.id)}
+                        style={[chipStyle, active && { borderColor: colors.accent, backgroundColor: colors.accentDim }]}
+                      >
+                        <Text style={{ color: active ? colors.text : colors.muted, fontWeight: '700', fontSize: 12 }}>{o.label}</Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              ) : null}
+            </View>
             {i > 0 ? <Button small variant="ghost" icon="arrow-up" onPress={() => movePlayer(i)} /> : null}
             {players.length > 1 ? (
               <Button small variant="ghost" icon="close" onPress={() => setPlayers((x) => x.filter((y) => y.key !== p.key))} />
             ) : null}
           </View>
         ))}
+        <Text style={ui.label}>Ansagen</Text>
+        <Segmented<VoiceMode>
+          options={[
+            { value: 'own', label: width < 420 ? 'Jeder eigene' : 'Jeder mit eigener Stimme' },
+            { value: 'host', label: width < 420 ? 'Alle meine' : 'Alle mit meiner Stimme' },
+          ]}
+          value={voiceMode}
+          onChange={setVoiceMode}
+        />
+        <Text style={{ color: colors.faint, fontSize: 12 }}>
+          {voiceMode === 'own'
+            ? `Freunde mit Konto hören ihre Stimme aus dem Profil. Gäste und wer keine eigene hat, bekommen deine (${myVoice}).`
+            : `Alle Ansagen kommen aus deiner Stimme (${myVoice}).`}{' '}
+          Tippe unter einem Namen auf die Stimme, um sie für diesen Spieler festzulegen.
+        </Text>
         {!players.some((p) => p.self) ? (
           <Button
             small

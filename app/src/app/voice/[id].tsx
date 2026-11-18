@@ -16,8 +16,10 @@ import {
   voiceLabel,
   type VoicePack,
 } from '@shared';
+import { ClipTrimmer } from '@/components/ClipTrimmer';
 import { Button, Card, ErrorText, Field, H2, Loading, P, Row, Screen, Segmented } from '@/components/ui';
 import { api, errorMessage, getApiBase } from '@/lib/api';
+import { canEditAudio, decodeAudio, encodeClip, pickAudioFile } from '@/lib/audioClip';
 import { playClip, say } from '@/lib/caller';
 import { confirm } from '@/lib/confirm';
 import { colors, radius } from '@/lib/theme';
@@ -57,6 +59,8 @@ export default function VoicePackScreen() {
   const [extraScores, setExtraScores] = useState<number[]>([]);
   const [scoreInput, setScoreInput] = useState('');
   const [name, setName] = useState<string | null>(null);
+  /** file (or existing clip) that is being trimmed for the selected call */
+  const [trim, setTrim] = useState<{ key: string; buffer: AudioBuffer } | null>(null);
   const timer = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => () => {
@@ -123,6 +127,30 @@ export default function VoicePackScreen() {
     });
   }
 
+  /** Upload an audio file (meme, jingle …) and cut out the part for the selected call. */
+  const uploadFile = () =>
+    run('file', async () => {
+      const file = await pickAudioFile();
+      if (!file) return;
+      setTrim({ key: selected, buffer: await decodeAudio(file) });
+    });
+
+  /** Trim the existing recording of the selected call again. */
+  const trimExisting = () =>
+    run('trimLoad', async () => {
+      const res = await fetch(clipUrl(pack, selected));
+      if (!res.ok) throw new Error('Aufnahme konnte nicht geladen werden');
+      setTrim({ key: selected, buffer: await decodeAudio(await res.blob()) });
+    });
+
+  const saveTrim = (start: number, end: number) =>
+    run('trimSave', async () => {
+      if (!trim) return;
+      const clip = await encodeClip(trim.buffer, start, end);
+      replacePack(await api<VoicePack>(`/api/voice-packs/${pack.id}/clips/${trim.key}`, { method: 'PUT', body: clip }));
+      setTrim(null);
+    });
+
   const removeClip = () =>
     run('delete', async () => {
       replacePack(await api<VoicePack>(`/api/voice-packs/${pack.id}/clips/${selected}`, { method: 'DELETE' }));
@@ -174,7 +202,7 @@ export default function VoicePackScreen() {
     return (
       <Pressable
         key={key}
-        onPress={() => !recording && setSelected(key)}
+        onPress={() => !recording && !trim && setSelected(key)}
         accessibilityRole="button"
         style={({ pressed }) => [s.chip, has && s.chipRecorded, active && s.chipActive, pressed && { opacity: 0.8 }]}
       >
@@ -217,6 +245,13 @@ export default function VoicePackScreen() {
           <P muted>
             Sprich nur ein, worauf du Lust hast. Alles ohne Aufnahme sagt die Standardstimme. Maximal {VOICE_MAX_SECONDS} Sekunden pro Ansage.
           </P>
+          {mine ? (
+            <P muted>
+              {canEditAudio()
+                ? 'Statt aufzunehmen kannst du auch eine Audiodatei hochladen (z. B. ein Meme als MP3) und die passende Stelle zuschneiden.'
+                : 'Audiodateien hochladen und zuschneiden geht in der Browser-Version.'}
+            </P>
+          ) : null}
         </Card>
 
         {/* action panel for the selected call */}
@@ -224,7 +259,7 @@ export default function VoicePackScreen() {
           <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
             <Ionicons name={isRec ? 'checkmark-circle' : 'ellipse-outline'} size={22} color={isRec ? colors.accent : colors.muted} />
             <View style={{ flex: 1 }}>
-              <Text style={s.panelTitle}>{voiceLabel(selected)}</Text>
+              <Text style={s.panelTitle}>{voiceLabel(trim ? trim.key : selected)}</Text>
               <Text style={s.panelSub}>{isRec ? 'Eigene Aufnahme' : `Standardstimme: „${standardText(selected)}“`}</Text>
             </View>
             {recording ? (
@@ -236,6 +271,15 @@ export default function VoicePackScreen() {
               </View>
             ) : null}
           </View>
+          {trim ? (
+            <ClipTrimmer
+              buffer={trim.buffer}
+              maxSeconds={VOICE_MAX_SECONDS}
+              saving={busy === 'trimSave'}
+              onSave={saveTrim}
+              onCancel={() => setTrim(null)}
+            />
+          ) : (
           <Row wrap>
             {mine ? (
               recording ? (
@@ -256,10 +300,17 @@ export default function VoicePackScreen() {
               onPress={() => (isRec ? playClip(clipUrl(pack, selected)) : say(standardText(selected)))}
               disabled={!!recording}
             />
+            {mine && canEditAudio() && !recording ? (
+              <Button title="Datei hochladen" icon="cloud-upload" variant="secondary" onPress={uploadFile} loading={busy === 'file'} />
+            ) : null}
+            {mine && isRec && canEditAudio() && !recording ? (
+              <Button title="Zuschneiden" icon="cut" variant="ghost" onPress={trimExisting} loading={busy === 'trimLoad'} />
+            ) : null}
             {mine && isRec ? (
               <Button title="Aufnahme löschen" icon="trash" variant="ghost" onPress={removeClip} loading={busy === 'delete'} disabled={!!recording} />
             ) : null}
           </Row>
+          )}
           <ErrorText>{actionError}</ErrorText>
         </Card>
 

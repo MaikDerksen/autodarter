@@ -15,8 +15,10 @@ export interface VoiceKeyDef {
   group: VoiceGroup;
 }
 
-export const VOICE_MAX_BYTES = 450_000;
-export const VOICE_MAX_SECONDS = 6;
+/** Uploaded clips are cut to at most this length (recordings stop automatically). */
+export const VOICE_MAX_SECONDS = 10;
+/** 10 s as 22 kHz mono WAV are ~440 kB – leaves room for recorded webm/m4a. */
+export const VOICE_MAX_BYTES = 600_000;
 export const VOICE_MAX_PACKS = 10;
 
 export const VOICE_CALLS: VoiceKeyDef[] = [
@@ -90,7 +92,14 @@ export interface VoicePack {
   version: number;
 }
 
-/** The pack a match uses (the one of the player who created the match). */
+/**
+ * Who speaks in a match: "host" = the pack of the player who created the match for everybody,
+ * "own" = every player with an account gets the pack chosen in their profile (players without
+ * one, and guests, get the host's pack). A pack chosen per player when creating the match wins.
+ */
+export type VoiceMode = 'host' | 'own';
+
+/** A pack as used in a match. */
 export interface MatchVoice {
   packId: string;
   name: string;

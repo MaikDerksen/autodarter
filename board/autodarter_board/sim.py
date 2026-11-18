@@ -147,7 +147,8 @@ class SimWorld:
     def calibration(self, cam: int) -> list[tuple[float, float]]:
         m = self.models[cam]
         pts = g.apply_h(m.H, g.CALIBRATION_POINTS)
-        return [(float(p[0] / self.width), float(p[1] / self.height)) for p in pts]
+        # edge coordinates like the app (pixel centre i -> (i + 0.5) / width), see detector.CALIB_ORIGIN
+        return [(float((p[0] + 0.5) / self.width), float((p[1] + 0.5) / self.height)) for p in pts]
 
     # ----------------------------------------------------------- rendering
     def render(self, cam: int, noise: int = 0) -> np.ndarray:

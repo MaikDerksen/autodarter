@@ -195,12 +195,14 @@ export default function MatchScreen() {
   useEffect(() => {
     if (!state) return;
     const perDart = state.settings.mode !== 'x01';
-    const items: { key: string; call: Call | null }[] = [];
+    const items: { key: string; call: Call | null; player: number }[] = [];
     for (const t of [previousTurn(state), state.turn]) {
       if (!t || !t.darts.length) continue;
-      if (perDart) t.darts.forEach((d) => items.push({ key: `d${d.eventIndex}`, call: { key: dartKey(d.seg), text: dartSay(d.seg) } }));
+      if (perDart) {
+        t.darts.forEach((d) => items.push({ key: `d${d.eventIndex}`, call: { key: dartKey(d.seg), text: dartSay(d.seg) }, player: t.player }));
+      }
       const wonLeg = t === state.turn && state.legFinished;
-      if (t.complete) items.push({ key: `t${t.darts[t.darts.length - 1].eventIndex}`, call: turnCall(state, t, wonLeg) });
+      if (t.complete) items.push({ key: `t${t.darts[t.darts.length - 1].eventIndex}`, call: turnCall(state, t, wonLeg), player: t.player });
     }
     if (announced.current === null) {
       announced.current = new Set(items.map((i) => i.key));
@@ -211,9 +213,22 @@ export default function MatchScreen() {
     for (const it of items) {
       if (announced.current.has(it.key)) continue;
       announced.current.add(it.key);
-      if (callerOn && it.call) announce(match?.voice, it.call);
+      // every player is announced with their own voice (chosen when the match was created)
+      if (callerOn && it.call) announce(match?.voices?.[it.player] ?? match?.voice, it.call);
     }
-  }, [state, callerOn, match?.voice]);
+  }, [state, callerOn, match?.voice, match?.voices]);
+
+  // somebody joined: reload the match (names, voices)
+  const playerCount = state?.players.length ?? 0;
+  useEffect(() => {
+    if (!id || !match || !playerCount || match.players.length === playerCount) return;
+    api<{ match: MatchSummary; canControl: boolean }>(`/api/matches/${id}`)
+      .then((r) => {
+        setMatch(r.match);
+        setCanControl(r.canControl);
+      })
+      .catch(() => undefined);
+  }, [id, match, playerCount]);
 
   const run = async (fn: () => Promise<{ state?: MatchState } | unknown>) => {
     setBusy(true);

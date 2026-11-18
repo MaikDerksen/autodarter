@@ -55,10 +55,11 @@ export default function VoicePacksScreen() {
   return (
     <Screen maxWidth={720}>
       <Card>
-        <H2>Ansage in deinen Spielen</H2>
+        <H2>Deine Stimme</H2>
         <P muted>
-          In Spielen, die du erstellst, sagt dieses Paket an – für alle am Board. Was im Paket nicht eingesprochen ist, übernimmt
-          die Standardstimme.
+          Diese Stimme sagt deine Würfe an, wenn im Spiel „Jeder mit eigener Stimme“ eingestellt ist. In Spielen, die du
+          erstellst, spricht sie außerdem für Gäste – oder für alle, wenn du „Alle mit meiner Stimme“ wählst. Was im Paket nicht
+          eingesprochen ist, übernimmt die Standardstimme.
         </P>
         <ChoiceRow
           title="Standardstimme"

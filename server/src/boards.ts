@@ -46,8 +46,11 @@ interface LiveBoard {
   settings: BoardSettings | null;
   /** Last stream request sent to the board (JSON), to avoid resending. */
   streamKey: string;
-  pending: Map<string, (msg: Extract<BoardToServer, { type: 'snapshot' }>) => void>;
+  /** answers of the board to requests (snapshot, auto calibration) by requestId */
+  pending: Map<string, (msg: BoardReply) => void>;
 }
+
+type BoardReply = Extract<BoardToServer, { type: 'snapshot' } | { type: 'auto_calibration' }>;
 
 const live = new Map<string, LiveBoard>();
 
@@ -180,7 +183,8 @@ function backupEntries(cal: Record<string, CameraCalibration | null> | undefined
   return out;
 }
 
-function requestSnapshot(id: string, camera: number): Promise<Extract<BoardToServer, { type: 'snapshot' }>> {
+/** Send a request to the board and wait for the answer with the same requestId. */
+function boardRequest<T extends BoardReply>(id: string, build: (requestId: string) => ServerToBoard, timeoutMs: number): Promise<T> {
   const l = live.get(id);
   if (!l) return Promise.reject(new HttpError(409, 'Board ist offline'));
   const requestId = randomUUID();
@@ -188,14 +192,18 @@ function requestSnapshot(id: string, camera: number): Promise<Extract<BoardToSer
     const timer = setTimeout(() => {
       l.pending.delete(requestId);
       reject(new HttpError(504, 'Board hat nicht rechtzeitig geantwortet'));
-    }, 8000);
+    }, timeoutMs);
     l.pending.set(requestId, (msg) => {
       clearTimeout(timer);
       l.pending.delete(requestId);
-      resolve(msg);
+      resolve(msg as T);
     });
-    sendToBoard(id, { type: 'snapshot_request', requestId, camera });
+    sendToBoard(id, build(requestId));
   });
+}
+
+function requestSnapshot(id: string, camera: number) {
+  return boardRequest<Extract<BoardReply, { type: 'snapshot' }>>(id, (requestId) => ({ type: 'snapshot_request', requestId, camera }), 8000);
 }
 
 /** WebSocket handler for board clients (Raspberry Pi). */
@@ -359,6 +367,7 @@ async function onBoardMessage(board: LiveBoard, msg: BoardToServer): Promise<voi
       break;
     }
     case 'snapshot':
+    case 'auto_calibration':
       board.pending.get(msg.requestId)?.(msg);
       break;
     case 'pong':
@@ -555,6 +564,29 @@ export async function boardRoutes(app: FastifyInstance): Promise<void> {
     const snap = await requestSnapshot(req.params.id, Number(req.params.cam));
     if (!snap.data) throw new HttpError(404, 'Kamera liefert kein Bild');
     return { data: snap.data, width: snap.width, height: snap.height };
+  });
+
+  /** Automatic calibration: the board looks for the dartboard in the image. Returns a proposal, nothing is saved. */
+  app.post<{ Params: { id: string; cam: string } }>('/api/boards/:id/cameras/:cam/auto-calibration', async (req) => {
+    await requireMember(req.params.id, userId(req));
+    const point = z.object({ x: z.number().min(-0.5).max(1.5), y: z.number().min(-0.5).max(1.5) });
+    const body = parse(
+      z.object({ prior: z.array(point).length(CALIBRATION_POINTS.length).nullish(), hint20: point.nullish() }),
+      req.body ?? {},
+    );
+    const l = live.get(req.params.id);
+    if (!l) throw new HttpError(409, 'Board ist offline');
+    if (!l.status?.capabilities?.autoCalibrate) {
+      throw new HttpError(409, 'Die Board-Software ist zu alt für die automatische Kalibrierung – bitte auf der Board-Seite „Software aktualisieren“.');
+    }
+    const camera = Number(req.params.cam);
+    const reply = await boardRequest<Extract<BoardReply, { type: 'auto_calibration' }>>(
+      req.params.id,
+      (requestId) => ({ type: 'auto_calibrate', requestId, camera, prior: body.prior ?? null, hint20: body.hint20 ?? null }),
+      25000,
+    );
+    req.log.info({ board: req.params.id, camera, ok: reply.result.ok, score: reply.result.score, mode: reply.result.mode }, 'auto calibration');
+    return reply.result;
   });
 
   app.put<{ Params: { id: string; cam: string } }>('/api/boards/:id/cameras/:cam/calibration', async (req) => {

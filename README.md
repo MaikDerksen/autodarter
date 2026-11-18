@@ -33,10 +33,12 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Freunde per Benutzername suchen oder per Einladungslink (`/invite/<name>`) einladen.
   - Wer gerade online ist, siehst du live (grüner Punkt). Beim Spielstart werden Freunde, die online sind, als Mitspieler vorgeschlagen.
   - Spielen Freunde mit ihrem Konto mit, zählt das Spiel in ihrer Statistik, und sie bekommen sofort eine Einladung mit „Öffnen“.
+  - **Freunde spielen gerade**: Läuft bei einem Freund ein Spiel, steht es oben auf „Spielen“. In der ersten Runde kannst du mit „Mitspielen“ noch einsteigen (du wirfst als Letzter der Runde, am Board des Spiels oder per „Remote spielen“ an deinem eigenen), danach kannst du zuschauen.
 - **Kameras live ansehen**: Livebild aller Kameras in der App, mit eingeblendetem Board-Raster der Kalibrierung und der erkannten Dartspitze
 - **Kamera-Ansicht im Spiel** wie bei Autodarts: *Virtuell · Kamera 1 · Kamera 2 · Kamera 3*. Das Kamerabild wird mit der Kalibrierung **entzerrt**, so dass das Board frontal erscheint (statt schräg von der Seite). Würfe werden darauf markiert, und du kannst auch dort zum Korrigieren tippen.
 - **Status-Ring** um das Board: grün = werfen, orange = Darts ziehen, rot = Board offline/gestoppt
 - **Kalibrieren** wie bei Autodarts: Pro Kamera ziehst du 4 Punkte auf die Außenkante des Doppelrings (20|1, 6|10, 3|19, 11|14), dazu einen 5. Punkt auf das Bull.
+  - **Automatisch erkennen**: Der Pi sucht das Board selbst im Kamerabild und setzt die Punkte. Gibt es schon eine Kalibrierung (oder hast du die Punkte grob gesetzt), wird sie nur nachgezogen. Sonst fragt die App einmal, wo die 20 ist. Du prüfst das Netz und speicherst.
   - Das Board-Raster wird dabei live projiziert.
   - Zum Feinjustieren gibt es eine Lupe, Pfeiltasten und Pfeil-Buttons.
   - **Bleibt gespeichert**: pro USB-Anschluss auf dem Pi (`data/calibration.json`) und als Sicherung auf dem Server. Licht aus, Neustart, kurz abgezogene Kamera – die Kalibrierung bleibt, bis du sie selbst neu setzt. Verliert der Pi seinen `data`-Ordner, holt er sie sich vom Server zurück.
@@ -58,7 +60,9 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Ohne Board bleibt die fertige Aufnahme mit allen drei Darts kurz stehen (ca. 2 s), dann ist automatisch der nächste Spieler dran.
   - Einzelnen Wurf korrigieren, Rückgängig, Weiter, Revanche, Spiel abbrechen
   - Ansage im Browser und in der iOS-/Android-App: X01 sagt die Punkte der Aufnahme an („One hundred and eighty“), Cricket und Around the Clock jeden Dart („Triple 20“, „Bullseye“)
-  - **Eigene Stimmen** (Profil → Stimmen verwalten): Jeder kann Ansagen selbst einsprechen – nur die, auf die er Lust hat, z. B. 180, Big Fish (170er Checkout) oder Triple 20. Alles andere sagt die Standardstimme. Pakete lassen sich mit Freunden teilen; im Spiel gilt das Paket dessen, der das Spiel erstellt hat.
+  - **Eigene Stimmen** (Profil → Stimmen verwalten): Jeder kann Ansagen selbst einsprechen – nur die, auf die er Lust hat, z. B. 180, Big Fish (170er Checkout) oder Triple 20. Alles andere sagt die Standardstimme. Pakete lassen sich mit Freunden teilen.
+    - Statt aufzunehmen kann man im Browser auch eine Audiodatei hochladen (z. B. ein Meme als MP3) und auf der Wellenform die passenden Sekunden auswählen (max. 10 s).
+    - Beim Spielstart: „Jeder mit eigener Stimme“ (jeder Freund mit Konto hört seine Stimme aus dem Profil, Gäste die des Erstellers) oder „Alle mit meiner Stimme“. Unter jedem Namen lässt sich die Stimme auch einzeln festlegen.
   - **Remote spielen**: Standard ist, dass alle am Board des Spiels werfen. Ein Mitspieler kann im Spiel unter „Remote spielen“ stattdessen sein eigenes Board wählen (z. B. zu Hause). Gezählt wird immer das Board des Spielers, der gerade dran ist.
 - **Statistik** mit Diagrammen und Vergleich mit Freunden (Zeitraum 7/30/90 Tage oder alles):
   - X01: Average-Verlauf, First-9, Punkteverteilung, Checkout-Quote und Trefferquote pro Double, 180er, 140+, 100+, höchster Checkout, bestes Leg
@@ -254,7 +258,7 @@ Mit dem Repository auf dem Pi geht es auch: `cd board && cp .env.example .env &&
 
 1. In der App unter **Boards → Board hinzufügen** den Code eingeben.
 2. Kameras montieren: im 120°-Abstand rund um das Board, eine mittig über der **6** oder **11**, keine über der 20. Neigung etwa 35–55° zur Board-Oberfläche, mit LED-Ring gegen Schatten.
-3. Auf der Board-Seite bei jeder Kamera **Kalibrieren** wählen und die 5 Punkte setzen, bis das grüne Raster genau auf den Drähten liegt.
+3. Auf der Board-Seite bei jeder Kamera **Kalibrieren** wählen und **Automatisch erkennen** drücken (oder die 5 Punkte von Hand setzen), bis das grüne Raster genau auf den Drähten liegt. Dann speichern.
 4. Mit dem **Erkennungstest** auf der Board-Seite prüfen, ob die Würfe richtig erkannt werden.
 
 ### 4. Spielen
@@ -334,5 +338,5 @@ Der Pi speichert seine Board-ID, das Board-Secret, die Kalibrierung (pro USB-Por
 
 - Die Erkennung ist klassische Bildverarbeitung, kein neuronales Netz. Sie ist im Simulator validiert, aber **noch nicht an einem echten Board getestet**. Die Schwellwerte lassen sich in der App anpassen.
 - Bounce-outs werden noch nicht gemeldet. Zwei Darts im selben Bewegungsfenster werden als einer gewertet.
-- Es gibt noch keine Auto-Kalibrierung und keine weiteren Spielmodi wie Shanghai oder Bob's 27. Die event-basierte Engine ist aber darauf ausgelegt.
+- Es gibt noch keine weiteren Spielmodi wie Shanghai oder Bob's 27. Die event-basierte Engine ist aber darauf ausgelegt.
 - Neue Boards können sich ohne Login am Server melden (sie erscheinen erst nach der Kopplung in einem Konto). Unbenutzte, nicht gekoppelte Boards werden nach 30 Tagen gelöscht.

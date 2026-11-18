@@ -3,7 +3,7 @@ import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Image, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent } from 'react-native';
 import Svg, { Circle, G, Line, Path, Text as SvgText } from 'react-native-svg';
-import { CALIBRATION_POINTS, type BoardSummary, type Point } from '@shared';
+import { CALIBRATION_POINTS, type AutoCalibration, type BoardSummary, type Point } from '@shared';
 import { boardToImage, wireframePath } from '@/components/BoardOverlay';
 import { Button, Card, ErrorText, H2, Loading, P, Row, Screen } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
@@ -34,6 +34,10 @@ export default function CalibrateScreen() {
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [dirty, setDirty] = useState(false);
+  const [auto, setAuto] = useState<AutoCalibration | null>(null);
+  /** automatic calibration found the board but needs a tap on the 20 */
+  const [pickHint, setPickHint] = useState(false);
+  const hadCalibration = useRef(false);
   const drag = useRef<{ index: number; offsetX: number; offsetY: number } | null>(null);
 
   const loadSnapshot = useCallback(async () => {
@@ -52,7 +56,10 @@ export default function CalibrateScreen() {
     api<BoardSummary>(`/api/boards/${id}`)
       .then((b) => {
         const c = b.calibration?.[String(cam)];
-        if (c?.points?.length === CALIBRATION_POINTS.length) setPoints(c.points);
+        if (c?.points?.length === CALIBRATION_POINTS.length) {
+          hadCalibration.current = true;
+          setPoints(c.points);
+        }
       })
       .catch(() => undefined);
     // initial data load of the screen (loadSnapshot shows its spinner right away)
@@ -100,8 +107,41 @@ export default function CalibrateScreen() {
     return () => window.removeEventListener('keydown', onKey);
   }, [nudge]);
 
+  /**
+   * Let the board find the dartboard. The current points help as a starting point when they mean
+   * something (saved calibration or moved by hand). The result is only shown - saving stays manual.
+   */
+  const runAuto = async (hint20?: Point) => {
+    setBusy('auto');
+    setError(null);
+    setPickHint(false);
+    try {
+      const usePrior = hadCalibration.current || dirty;
+      const res = await api<AutoCalibration>(`/api/boards/${id}/cameras/${cam}/auto-calibration`, {
+        method: 'POST',
+        body: { prior: usePrior ? points : null, hint20: hint20 ?? null },
+      });
+      setAuto(res);
+      if (res.points && (res.ok || res.needsHint)) {
+        setPoints(res.points);
+        setDirty(true);
+      }
+      if (res.needsHint) setPickHint(true);
+      // show the image the board just looked at
+      void loadSnapshot();
+    } catch (e) {
+      setError(errorMessage(e));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const onGrant = (e: GestureResponderEvent) => {
     const { locationX, locationY, pageX, pageY } = e.nativeEvent;
+    if (pickHint) {
+      void runAuto({ x: locationX / imgW, y: locationY / imgH });
+      return;
+    }
     let best = -1;
     let bestDist = 36;
     points.forEach((p, i) => {
@@ -151,6 +191,29 @@ export default function CalibrateScreen() {
             und den Bull-Punkt in die Mitte des Bullseye. Das grüne Netz zeigt live, wie das Board aus Sicht dieser Kamera erkannt wird – es muss genau auf
             den Drähten liegen. Tippen auf eine freie Stelle setzt den ausgewählten Punkt dorthin. Feinjustierung: Pfeiltasten (Shift = 10 px) oder Buttons.
           </P>
+          <Row wrap style={{ alignItems: 'center' }}>
+            <Button title="Automatisch erkennen" icon="scan" onPress={() => runAuto()} loading={busy === 'auto'} disabled={!snap && busy === 'snapshot'} />
+            <Text style={{ color: colors.muted, flex: 1, minWidth: 220 }}>
+              Die Kamera sucht das Board selbst – danach prüfen, ob das Netz auf den Drähten liegt, und speichern.
+            </Text>
+          </Row>
+          {auto ? (
+            <View style={[st.autoInfo, { borderColor: auto.ok ? colors.accent : auto.needsHint ? colors.info : colors.warning }]}>
+              <Ionicons
+                name={auto.ok ? 'checkmark-circle' : auto.needsHint ? 'hand-left' : 'alert-circle'}
+                size={20}
+                color={auto.ok ? colors.accent : auto.needsHint ? colors.info : colors.warning}
+              />
+              <Text style={{ color: colors.text, flex: 1 }}>
+                {auto.ok
+                  ? `Automatisch erkannt (Qualität ${Math.round(auto.score * 100)} %). Prüfe das Netz und speichere.`
+                  : pickHint
+                    ? 'Board gefunden. Tippe jetzt im Kamerabild einmal auf das Feld der 20 – dann weiß die Erkennung, wie das Board gedreht ist.'
+                    : auto.message || 'Board nicht sicher erkannt – bitte von Hand kalibrieren.'}
+                {auto.ok && auto.message ? ` ${auto.message}` : ''}
+              </Text>
+            </View>
+          ) : null}
           <Row wrap>
             {CALIBRATION_POINTS.map((p, i) => (
               <Pressable key={p.id} onPress={() => setSelected(i)} style={[st.pointChip, selected === i && { borderColor: POINT_COLORS[i], backgroundColor: POINT_COLORS[i] + '22' }]}>
@@ -185,6 +248,11 @@ export default function CalibrateScreen() {
                   </G>
                 ))}
               </Svg>
+              {pickHint ? (
+                <View style={st.hintBanner} pointerEvents="none">
+                  <Text style={{ color: '#fff', fontWeight: '800' }}>Tippe auf die 20</Text>
+                </View>
+              ) : null}
               <View
                 style={StyleSheet.absoluteFill}
                 onStartShouldSetResponder={() => true}
@@ -276,6 +344,16 @@ const st = StyleSheet.create({
     borderColor: colors.border,
   },
   dot: { width: 10, height: 10, borderRadius: 5 },
+  autoInfo: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 12, borderRadius: radius.md, borderWidth: 1, backgroundColor: colors.bg },
+  hintBanner: {
+    position: 'absolute',
+    top: 10,
+    alignSelf: 'center',
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 999,
+    backgroundColor: 'rgba(56,189,248,0.85)',
+  },
   loupe: {
     width: LOUPE,
     height: LOUPE,

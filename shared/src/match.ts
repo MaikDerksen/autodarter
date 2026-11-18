@@ -46,6 +46,11 @@ export interface PlayerInfo {
   /** Remote play: this player throws at their own board (default: the board of the match). */
   boardId?: string | null;
   boardName?: string | null;
+  /**
+   * Voice for this player's calls, chosen when the match was created: a pack id, null = standard
+   * voice, missing = automatic (see the match's voice mode).
+   */
+  voicePackId?: string | null;
 }
 
 export type DartSource = 'board' | 'manual';
