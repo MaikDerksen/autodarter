@@ -54,7 +54,7 @@ type BoardReply = Extract<BoardToServer, { type: 'snapshot' } | { type: 'auto_ca
 
 const live = new Map<string, LiveBoard>();
 
-/** Emits 'dart' (boardId, dart), 'takeout_started' (boardId), 'takeout_finished' (boardId). */
+/** Emits 'dart' (boardId, dart), 'dart_out' (boardId, dart id), 'takeout_started' (boardId), 'takeout_finished' (boardId). */
 export const boardEvents = new EventEmitter();
 
 /** Resolves the running match of a board (set by the match module to avoid an import cycle). */
@@ -347,6 +347,11 @@ async function onBoardMessage(board: LiveBoard, msg: BoardToServer): Promise<voi
       publishBoard(board.id, { type: 'board_dart', boardId: board.id, dart: msg.dart });
       boardEvents.emit('dart', board.id, msg.dart as DetectedDart);
       break;
+    case 'dart_out':
+      if (!board.ownerId || typeof msg.id !== 'string') return;
+      publishBoard(board.id, { type: 'board_dart_out', boardId: board.id, id: msg.id });
+      boardEvents.emit('dart_out', board.id, msg.id);
+      break;
     case 'takeout_started':
     case 'takeout_finished':
       if (!board.ownerId) return;
@@ -402,6 +407,7 @@ const settingsBody = z
     minDartArea: z.number().int().min(10).max(5000),
     takeoutArea: z.number().int().min(500).max(200000),
     settleFrames: z.number().int().min(1).max(30),
+    bounceOut: z.number().int().min(0).max(1),
   })
   .partial();
 

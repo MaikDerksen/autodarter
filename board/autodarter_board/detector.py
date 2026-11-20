@@ -19,13 +19,14 @@ import math
 import threading
 import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 
 import cv2
 import numpy as np
 
 from .config import Settings
-from .geometry import BOARD_RADIUS, apply_h, board_to_image_homography, circle_points, estimate_pose, project3d, score
+from .geometry import BOARD_RADIUS, apply_h, board_to_image_homography, calibration_mirrored, circle_points, estimate_pose, project3d, score
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +36,13 @@ PROC_WIDTH = 640  # motion / calm detection and the decisions (areas) run on thi
 # integers, so a normalised x maps to x * width - 0.5.
 CALIB_ORIGIN = 0.5
 FULL_BLUR = 3  # Gaussian kernel for the full resolution dart analysis
+
+# Official rule: a dart that bounces out or falls out of the board before it is retrieved does not score.
+BOUNCE_MAX_S = 1.5  # a bounce-out is a short motion (dart hits and drops) ...
+BOUNCE_AREA = 2.0  # ... seen by (at least two) cameras with >= BOUNCE_AREA * minDartArea moving pixels ...
+QUIET_AFTER_HAND_S = 3.0  # ... and not right after a hand was at the board (walking away after the takeout)
+GONE_SHARE = 0.75  # a dart fell out when (nearly) all its pixels show the empty board again
+AGREEMENT_WINDOW = 12  # darts seen by >= 3 cameras: does a camera agree with the others?
 
 
 @dataclass
@@ -67,6 +75,9 @@ class CameraState:
     def __init__(self, index: int, points: list[tuple[float, float]]):
         self.index = index
         self.points = points
+        # points in mirrored order (two of them swapped): every board position of this camera would be
+        # mirrored -> it still helps to see motion / hands, but its darts are not used
+        self.mirrored = calibration_mirrored(points)
         self.size: tuple[int, int] | None = None
         self.H: np.ndarray | None = None  # board -> proc image
         self.Hinv: np.ndarray | None = None
@@ -145,6 +156,17 @@ class Detector:
         self._pre_takeout: tuple[str, int] | None = None
         self._lock = threading.RLock()
         self.last_areas: dict[int, int] = {}
+        # darts of the current turn: id + per camera the pixels where it covers the empty board (fall-out check)
+        self.turn_darts: list[dict] = []
+        self._blobs: dict[int, np.ndarray] = {}
+        # the motion before the current evaluation (bounce-out check)
+        self._motion_start = 0.0
+        self._motion_last = 0.0
+        self._motion_peak: dict[int, int] = {}
+        self._motion_hand = False
+        self._quiet_until = 0.0
+        # per camera: was its line part of the consensus of darts that >= 3 cameras saw
+        self.agreement: dict[int, deque] = {}
         # lighting: mean brightness per camera, "settling" until, and whether the board is too dark
         self._means: dict[int, np.ndarray] = {}
         self._light_until = 0.0
@@ -156,7 +178,14 @@ class Detector:
             if points is None:
                 self.cams.pop(index, None)
             else:
-                self.cams[index] = CameraState(index, [tuple(p) for p in points])
+                cam = CameraState(index, [tuple(p) for p in points])
+                self.agreement.pop(index, None)
+                if cam.mirrored:
+                    log.warning(
+                        "Kalibrierung von Kamera %d ist spiegelverkehrt (Punkte vertauscht) – ihre Darts werden ignoriert, bitte neu kalibrieren",
+                        index + 1,
+                    )
+                self.cams[index] = cam
 
     def reset(self) -> None:
         with self._lock:
@@ -167,6 +196,9 @@ class Detector:
             self.moving = False
             self.calm = 0
             self._pre_takeout = None
+            self.turn_darts = []
+            self._motion_peak = {}
+            self._motion_hand = False
 
     def set_detecting(self, on: bool) -> None:
         with self._lock:
@@ -177,6 +209,18 @@ class Detector:
     @property
     def calibrated(self) -> bool:
         return bool(self.cams)
+
+    def camera_issue(self, index: int) -> str | None:
+        """'mirrored': calibration points swapped; 'inconsistent': its darts often disagree with the other cameras."""
+        cam = self.cams.get(index)
+        if cam is None:
+            return None
+        if cam.mirrored:
+            return "mirrored"
+        hist = self.agreement.get(index)
+        if hist is not None and len(hist) >= 8 and sum(hist) / len(hist) < 0.4:
+            return "inconsistent"
+        return None
 
     def public_state(self) -> str:
         if not self.detecting:
@@ -234,21 +278,32 @@ class Detector:
         thr = s.diffThreshold
         motion_px = max(15, s.minDartArea // 2)
         moving_now = False
+        frame_diff: dict[int, int] = {}
         for idx, g in grays.items():
             cam = self.cams[idx]
             m = cv2.countNonZero(cv2.bitwise_and((cv2.absdiff(g, cam.prev) > thr).astype(np.uint8) * 255, cam.roi))
             cam.prev = g
+            frame_diff[idx] = m
             if m > motion_px:
                 moving_now = True
 
         if moving_now:
+            now = time.monotonic()
+            if not self.moving:
+                self._motion_start, self._motion_peak, self._motion_hand = now, {}, False
+            self._motion_last = now
+            for idx, m in frame_diff.items():
+                self._motion_peak[idx] = max(self._motion_peak.get(idx, 0), m)
             self.moving = True
             self.calm = 0
             # a hand in front of the board -> takeout started (no need to wait for calm)
             if self.state != "takeout_in_progress":
                 areas = {i: self._change_area(i, g, self.cams[i].ref) for i, g in grays.items()}
                 if self._is_hand(areas):
+                    self._motion_hand = True
                     self._enter_takeout(events)
+            else:
+                self._motion_hand = True
             return events
 
         if not self.moving:
@@ -334,10 +389,12 @@ class Detector:
         self.last_areas = areas
 
         if self._is_hand(areas):
+            self._motion_hand = True
             self._enter_takeout(events)
             return
 
         if self.state == "takeout_in_progress":
+            self._quiet_until = time.monotonic() + QUIET_AFTER_HAND_S
             # areas = change against the board before the hand appeared
             if max(areas.values()) < s.minDartArea * 0.75 and self._pre_takeout:
                 # the hand went away without changing anything
@@ -350,12 +407,25 @@ class Detector:
             self.darts = 0
             self.state = "throw"
             self._pre_takeout = None
+            self.turn_darts = []
             self._set_refs(grays, fulls, empty=True)
             events.append(("takeout_finished",))
             events.append(("state",))
             return
 
+        # A dart of this turn fell out (also while the next one flew in): its pixels show the empty
+        # board again. It does not score, and the hole it leaves must not be taken for a new dart.
+        gone = self._gone_darts(grays)
+        for d in gone:
+            self.turn_darts.remove(d)
+            log.info("dart %s fell out of the board", d["id"])
+            events.append(("dart_out", d["id"]))
+        masks = {i: self._only_new(i, m, grays[i]) for i, m in masks.items()}
+        areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
+
         if max(areas.values()) < s.minDartArea:
+            if not gone and max(areas.values()) < s.minDartArea // 2 and self._bounced_out():
+                self._add_bounce_out(events)
             self._set_refs(grays, fulls)  # noise / slow light change
             return
 
@@ -364,26 +434,33 @@ class Detector:
             return
 
         observations = []
+        self._blobs = {}
         # At least one camera saw a dart. Far from a camera a dart is small in its image (often just
         # below minDartArea), but every additional view makes the intersection much more stable.
         for idx, mask in masks.items():
-            if areas[idx] < max(8, s.minDartArea // 3):
+            if areas[idx] < max(8, s.minDartArea // 3) or self.cams[idx].mirrored:
                 continue
             obs = self._analyze(idx, mask, fulls.get(idx))
             if obs is not None:
                 observations.append(obs)
         result = fuse(observations)
-        self._set_refs(grays, fulls)
         if result is None:
+            self._set_refs(grays, fulls)
             log.info("change detected but no dart found (areas %s)", areas)
             return
         x, y, cams, confidence = result
+        if len(observations) >= 3:
+            for o in observations:
+                self.agreement.setdefault(o.camera, deque(maxlen=AGREEMENT_WINDOW)).append(o.camera in cams)
         number, multiplier = score(x, y)
         tips = {}
         for idx in cams:
             cam = self.cams[idx]
             p = apply_h(cam.Hf, [[x, y]])[0] + CALIB_ORIGIN
             tips[idx] = {"x": float(p[0] / cam.full_size[0]), "y": float(p[1] / cam.full_size[1])}
+        dart_id = uuid.uuid4().hex
+        self._remember(dart_id, grays)
+        self._set_refs(grays, fulls)
         self.darts += 1
         if self.darts >= 3:
             self.state = "takeout"
@@ -392,7 +469,7 @@ class Detector:
             (
                 "dart",
                 {
-                    "id": uuid.uuid4().hex,
+                    "id": dart_id,
                     "x": round(float(x), 2),
                     "y": round(float(y), 2),
                     "seg": {"number": number, "multiplier": multiplier},
@@ -404,11 +481,80 @@ class Detector:
         )
         events.append(("state",))
 
+    # ------------------------------------------------------------------ bounce-outs and fall-outs
+    def _only_new(self, idx: int, mask: np.ndarray, g: np.ndarray) -> np.ndarray:
+        """Changed pixels that are not the empty board (where a dart fell out, the empty board is back)."""
+        cam = self.cams[idx]
+        if cam.empty is None or cam.empty is cam.ref or cam.empty.shape != g.shape:
+            return mask
+        new = (cv2.absdiff(g, cam.empty) > self.settings.diffThreshold).astype(np.uint8) * 255
+        return cv2.bitwise_and(mask, new)
+
+    def _remember(self, dart_id: str, grays: dict[int, np.ndarray]) -> None:
+        """Keep the pixels where the new dart covers the empty board, per camera (for the fall-out check)."""
+        stored = {}
+        for idx, blob in self._blobs.items():
+            cam, g = self.cams.get(idx), grays.get(idx)
+            if cam is None or g is None or cam.empty is None or cam.empty.shape != g.shape:
+                continue
+            sel = blob & (cv2.absdiff(g, cam.empty) > self.settings.diffThreshold)
+            ys, xs = np.nonzero(sel)
+            if len(xs) < 10:
+                continue
+            x0, y0 = int(xs.min()), int(ys.min())
+            stored[idx] = (sel[y0 : int(ys.max()) + 1, x0 : int(xs.max()) + 1].copy(), x0, y0, cam.empty)
+        self.turn_darts.append({"id": dart_id, "masks": stored})
+
+    def _gone_darts(self, grays: dict[int, np.ndarray]) -> list[dict]:
+        thr = self.settings.diffThreshold
+        gone = []
+        for d in self.turn_darts:
+            shares = []
+            for idx, (m, x0, y0, empty) in d["masks"].items():
+                cam, g = self.cams.get(idx), grays.get(idx)
+                # the empty board image changed (light switched, recalibrated): no statement possible
+                if cam is None or g is None or cam.empty is not empty or empty.shape != g.shape:
+                    continue
+                h, w = m.shape
+                back = cv2.absdiff(g[y0 : y0 + h, x0 : x0 + w], empty[y0 : y0 + h, x0 : x0 + w])[m] <= thr
+                if back.size >= 10:
+                    shares.append(float(back.mean()))
+            # every camera that still sees the spot must see the empty board there (a newer dart in
+            # front of it can hide it in one camera)
+            if shares and max(shares) >= GONE_SHARE and float(np.median(shares)) >= GONE_SHARE - 0.15:
+                gone.append(d)
+        return gone
+
+    def _bounced_out(self) -> bool:
+        """A short, dart-sized motion in front of the board that left nothing behind."""
+        s = self.settings
+        if not getattr(s, "bounceOut", 1) or self.state != "throw" or self.darts >= 3:
+            return False
+        if self._motion_hand or self._motion_start < self._quiet_until or self._motion_last - self._motion_start > BOUNCE_MAX_S:
+            return False
+        lo = BOUNCE_AREA * s.minDartArea
+        seen = [p for p in self._motion_peak.values() if p >= lo]
+        if any(p >= s.takeoutArea for p in self._motion_peak.values()):
+            return False
+        return len(seen) >= min(2, len(self.cams))
+
+    def _add_bounce_out(self, events: list[tuple]) -> None:
+        log.info("bounce-out: dart hit the board and dropped (peaks %s)", self._motion_peak)
+        self.darts += 1
+        if self.darts >= 3:
+            self.state = "takeout"
+            events.append(("state",))
+        events.append(
+            ("dart", {"id": uuid.uuid4().hex, "seg": {"number": 0, "multiplier": 0}, "confidence": 0.5, "cameras": [], "out": "bounce"})
+        )
+        events.append(("state",))
+
     def _analyze(self, idx: int, mask: np.ndarray, full: np.ndarray | None = None) -> Observation | None:
         cam = self.cams[idx]
         blob = self._dart_blob(cam, mask)
         if blob is None:
             return None
+        self._blobs[idx] = blob
         ys, xs = np.nonzero(blob)
         if len(xs) < max(8, self.settings.minDartArea // 3):
             return None
@@ -500,6 +646,9 @@ class Detector:
         ref = cv2.GaussianBlur(cam.ref_full[y0:y1, x0:x1], k, 0)
         thr = self.settings.diffThreshold
         changed = (cv2.absdiff(cur, ref) > thr) & (near > 0)
+        if cam.empty_full is not None and cam.empty_full is not cam.ref_full and cam.empty_full.shape == full.shape:
+            # a dart that fell out at the same time leaves the empty board behind, not a new dart
+            changed &= cv2.absdiff(cur, cv2.GaussianBlur(cam.empty_full[y0:y1, x0:x1], k, 0)) > thr
         fy, fx = np.nonzero(changed)
         if len(fx) < max(8, self.settings.minDartArea // 3) * sx * sy:
             return None, None
@@ -674,8 +823,10 @@ def fuse(obs: list[Observation]) -> tuple[float, float, list[int], float] | None
             # the image of a dart starts at its tip: a line whose visible tip lies clearly in front of X
             # (towards its camera) does not belong to a dart at X
             inliers = [o for o in obs if abs(float(o.normal @ X - o.offset)) < INLIER_MM and _behind(o, X) > -TIP_BEHIND_MM]
-            if not inliers:
-                inliers = [a, b]
+            if a not in inliers or b not in inliers:
+                # X contradicts what one of the two cameras saw itself: not a candidate (with a broken
+                # camera this used to pick a point somewhere on the line of a good one)
+                continue
             # ties (three lines, one of them wrong: every pair has two inliers) -> the better conditioned pair
             angle = abs(float(np.linalg.det(np.array([a.normal, b.normal]))))
             score_ = (round(sum(o.weight for o in inliers), 6), round(a.weight + b.weight, 6), angle)

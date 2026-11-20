@@ -42,9 +42,15 @@ function hitsFor(darts: DartView[]): BoardHit[] {
   const out: BoardHit[] = [];
   darts.forEach((d, i) => {
     const pos = d.x !== undefined && d.y !== undefined ? { x: d.x, y: d.y } : segmentCenter(d.seg);
-    if (pos) out.push({ ...pos, label: String(i + 1) });
+    // a dart that fell out stays visible where it was, greyed out (it scores nothing)
+    if (pos) out.push({ ...pos, label: String(i + 1), ...(d.out ? { color: '#6b7280' } : {}) });
   });
   return out;
+}
+
+/** Second line of a dart slot: why a dart is a MISS by rule. */
+function outLabel(d: DartView): string | null {
+  return d.out === 'bounce' ? 'Abpraller' : d.out === 'fall' ? 'rausgefallen' : null;
 }
 
 function previousTurn(state: MatchState): TurnView | null {
@@ -460,7 +466,7 @@ export default function MatchScreen() {
             >
               <Text style={[s.slotText, !d && { color: colors.faint }]}>{d ? d.label : '–'}</Text>
               <Text style={[s.slotPts, atc && d ? { color: d.hit ? colors.accent : colors.faint } : null]}>
-                {d && state.settings.mode === 'x01' ? d.points : d && atc ? (d.hit ? 'Treffer' : 'daneben') : ' '}
+                {d && outLabel(d) ? outLabel(d) : d && state.settings.mode === 'x01' ? d.points : d && atc ? (d.hit ? 'Treffer' : 'daneben') : ' '}
               </Text>
             </Pressable>
           );
@@ -545,6 +551,7 @@ export default function MatchScreen() {
     { value: 'virtual', label: 'Virtuell' },
     ...cams.map((c) => ({ value: c.index as BoardView, label: `${width < 480 ? 'Cam' : 'Kamera'} ${c.index + 1}` })),
   ];
+  const viewIssue = typeof view === 'number' ? cams.find((c) => c.index === view)?.issue : null;
 
   const inputPanel = (
     <Card style={{ alignItems: 'center' }}>
@@ -565,7 +572,11 @@ export default function MatchScreen() {
                 const active = o.value === view;
                 return (
                   <Pressable key={String(o.value)} onPress={() => changeView(o.value)} style={[s.viewChip, active && s.viewChipActive]}>
-                    <Ionicons name={o.value === 'virtual' ? 'disc' : 'videocam'} size={14} color={active ? colors.text : colors.muted} />
+                    <Ionicons
+                      name={o.value === 'virtual' ? 'disc' : cams.find((c) => c.index === o.value)?.issue ? 'warning' : 'videocam'}
+                      size={14}
+                      color={o.value !== 'virtual' && cams.find((c) => c.index === o.value)?.issue ? colors.danger : active ? colors.text : colors.muted}
+                    />
                     <Text style={[s.viewChipText, active && { color: colors.text }]}>{o.label}</Text>
                   </Pressable>
                 );
@@ -584,6 +595,16 @@ export default function MatchScreen() {
             />
           </View>
           {typeof view === 'number' && !frontFrame ? <Text style={s.viewHint}>Kamerabild wird geladen …</Text> : null}
+          {viewIssue === 'mirrored' ? (
+            <Text style={[s.viewHint, { color: colors.danger }]}>
+              Die Kalibrierung dieser Kamera ist spiegelverkehrt – Bild und Markierungen passen nicht zusammen, ihre Darts werden ignoriert. Bitte neu
+              kalibrieren.
+            </Text>
+          ) : viewIssue === 'inconsistent' ? (
+            <Text style={[s.viewHint, { color: colors.warning }]}>Diese Kamera liegt oft neben den anderen – Kalibrierung prüfen.</Text>
+          ) : typeof view === 'number' && frontFrame ? (
+            <Text style={s.viewHint}>Die Zahlen markieren die Spitze – der Rest des Darts ragt aus dem Board und erscheint deshalb als langer Strich.</Text>
+          ) : null}
         </>
       ) : (
         <Keypad onSegment={(seg) => void throwSegment(seg)} disabled={busy || inputLocked} />

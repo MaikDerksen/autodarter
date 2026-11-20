@@ -1,6 +1,6 @@
 import { useMemo } from 'react';
-import Svg, { Circle, Path } from 'react-native-svg';
-import { applyHomography, BOARD, CALIBRATION_POINTS, computeHomography, type Mat3, type Point } from '@shared';
+import Svg, { Circle, Path, Text as SvgText } from 'react-native-svg';
+import { applyHomography, BOARD, CALIBRATION_POINTS, computeHomography, SECTORS, type Mat3, type Point } from '@shared';
 
 const RINGS = [BOARD.doubleOuter, BOARD.doubleInner, BOARD.tripleOuter, BOARD.tripleInner, BOARD.bullRadius, BOARD.doubleBullRadius];
 
@@ -32,6 +32,47 @@ export function wireframePath(H: Mat3): string {
   return parts.join('');
 }
 
+/** Radius (mm) of the printed number ring of a standard board. */
+const NUMBER_RING = 196;
+
+/**
+ * Sector numbers projected into the camera image: with a right calibration they sit on the numbers
+ * printed on the board. A rotated or mirrored calibration (points swapped) shows up at once.
+ */
+export function sectorLabels(H: Mat3): { n: number; x: number; y: number }[] {
+  return SECTORS.map((n, i) => {
+    const a = ((90 - i * 18) * Math.PI) / 180;
+    const p = applyHomography(H, { x: NUMBER_RING * Math.cos(a), y: NUMBER_RING * Math.sin(a) });
+    return { n, x: p.x, y: p.y };
+  });
+}
+
+export function SectorNumbers({ H, color = '#facc15', size = 13 }: { H: Mat3 | null; color?: string; size?: number }) {
+  if (!H) return null;
+  return (
+    <>
+      {sectorLabels(H).map((l) =>
+        // dark outline first, then the number on top (readable on black and cream segments)
+        [true, false].map((outline) => (
+          <SvgText
+            key={`${l.n}-${outline ? 'o' : 'f'}`}
+            x={l.x}
+            y={l.y + size * 0.36}
+            fill={color}
+            stroke={outline ? '#000' : 'none'}
+            strokeWidth={outline ? size / 4 : 0}
+            fontSize={size}
+            fontWeight="900"
+            textAnchor="middle"
+          >
+            {String(l.n)}
+          </SvgText>
+        )),
+      )}
+    </>
+  );
+}
+
 /** Projected board wireframe drawn over a camera image. */
 export function BoardOverlay({
   points,
@@ -39,21 +80,22 @@ export function BoardOverlay({
   height,
   color = '#22c55e',
   tip,
+  numbers = false,
 }: {
   points: Point[] | null | undefined;
   width: number;
   height: number;
   color?: string;
   tip?: Point | null;
+  /** also draw the sector numbers (to check the orientation of the calibration) */
+  numbers?: boolean;
 }) {
-  const d = useMemo(() => {
-    if (!points || width <= 0 || height <= 0) return null;
-    const H = boardToImage(points, width, height);
-    return H ? wireframePath(H) : null;
-  }, [points, width, height]);
+  const H = useMemo(() => (!points || width <= 0 || height <= 0 ? null : boardToImage(points, width, height)), [points, width, height]);
+  const d = useMemo(() => (H ? wireframePath(H) : null), [H]);
   return (
     <Svg width={width} height={height} style={{ position: 'absolute', left: 0, top: 0 }} pointerEvents="none">
       {d ? <Path d={d} stroke={color} strokeWidth={1.2} fill="none" opacity={0.85} /> : null}
+      {numbers ? <SectorNumbers H={H} size={Math.max(9, Math.min(14, width / 40))} /> : null}
       {tip ? <Circle cx={tip.x * width} cy={tip.y * height} r={6} stroke="#fff" strokeWidth={2} fill="#ef4444" /> : null}
     </Svg>
   );

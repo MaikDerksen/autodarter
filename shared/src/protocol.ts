@@ -3,7 +3,7 @@
  * The Python board client mirrors these shapes in board/autodarter_board/protocol.py.
  */
 import type { Point, Segment } from './board';
-import type { MatchSettings, MatchState, PlayerInfo } from './match';
+import type { DartOut, MatchSettings, MatchState, PlayerInfo } from './match';
 import type { MatchVoice, VoiceMode } from './voice';
 
 export type BoardState =
@@ -26,7 +26,14 @@ export interface CameraInfo {
   fps: number;
   ok: boolean;
   calibrated: boolean;
+  /**
+   * mirrored: calibration points swapped (the camera is ignored until it is recalibrated);
+   * inconsistent: its darts often disagree with the other cameras (calibration probably off).
+   */
+  issue?: CameraIssue | null;
 }
+
+export type CameraIssue = 'mirrored' | 'inconsistent';
 
 /** Calibration points in normalised image coordinates (0..1), ordered like CALIBRATION_POINTS. */
 export interface CameraCalibration {
@@ -46,6 +53,8 @@ export interface BoardSettings {
   takeoutArea: number;
   /** Number of calm frames before a change is evaluated. */
   settleFrames: number;
+  /** 1 = a dart that hits the board and drops right away is reported as a bounce-out (MISS). */
+  bounceOut?: number;
 }
 
 export interface BoardStatus {
@@ -76,14 +85,16 @@ export const BOARD_VIEW = 232;
 
 export interface DetectedDart {
   id: string;
-  x: number;
-  y: number;
+  /** board position in mm (missing for a bounce-out) */
+  x?: number;
+  y?: number;
   seg: Segment;
   confidence: number;
   /** Indices of the cameras that contributed. */
   cameras: number[];
   /** Per-camera tip positions in normalised image coordinates (for debugging overlays). */
   tips?: Record<number, Point>;
+  out?: DartOut;
 }
 
 // ---------------------------------------------------------------- board -> server
@@ -99,6 +110,8 @@ export type BoardToServer =
     }
   | { type: 'status'; status: BoardStatus }
   | { type: 'dart'; dart: DetectedDart }
+  /** a dart of the current turn fell out of the board (id of its dart message) */
+  | { type: 'dart_out'; id: string }
   | { type: 'takeout_started' }
   | { type: 'takeout_finished' }
   | { type: 'frame'; camera: number; data: string; width: number; height: number; view?: StreamView }
@@ -244,6 +257,7 @@ export type ServerToClient =
   | { type: 'board_status'; board: BoardSummary }
   | { type: 'board_frame'; boardId: string; camera: number; data: string; width: number; height: number; view: StreamView }
   | { type: 'board_dart'; boardId: string; dart: DetectedDart }
+  | { type: 'board_dart_out'; boardId: string; id: string }
   | { type: 'board_event'; boardId: string; event: 'takeout_started' | 'takeout_finished' }
   /** A friend came online / went offline. */
   | { type: 'presence'; userId: string; online: boolean }

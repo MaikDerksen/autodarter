@@ -203,6 +203,7 @@ export function useBoardLive(boardId: string | null | undefined, opts: { stream?
       if (msg.view === 'front') setFrontFrames((f) => ({ ...f, [msg.camera]: frame }));
       else setFrames((f) => ({ ...f, [msg.camera]: frame }));
     } else if (msg.type === 'board_dart' && msg.boardId === boardId) setLastDart(msg.dart);
+    else if (msg.type === 'board_dart_out' && msg.boardId === boardId) setLastDart((d) => (d && d.id === msg.id ? { ...d, out: 'fall' } : d));
     else if (msg.type === 'board_event' && msg.boardId === boardId) setLastEvent({ event: msg.event, at: Date.now() });
   });
 

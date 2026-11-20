@@ -1,11 +1,12 @@
 import type { FastifyInstance } from 'fastify';
 import { z } from 'zod';
-import { isValidSegment, parseSegment, scoreFromCoords, type Segment } from '@shared/board';
+import { isValidSegment, MISS, parseSegment, scoreFromCoords, type Segment } from '@shared/board';
 import {
   computeMatch,
   describeSettings,
   undoEvents,
   validateSettings,
+  type DartEvent,
   type MatchEvent,
   type MatchSettings,
   type MatchState,
@@ -279,8 +280,8 @@ function mutate(m: LiveMatch, fn: (events: MatchEvent[], state: MatchState) => M
   });
 }
 
-function dartEvent(seg: Segment, src: 'board' | 'manual', x?: number, y?: number): MatchEvent {
-  return { t: 'dart', seg, src, at: Date.now(), ...(x !== undefined && y !== undefined ? { x, y } : {}) };
+function dartEvent(seg: Segment, src: 'board' | 'manual', x?: number, y?: number, extra?: Pick<DartEvent, 'bid' | 'out'>): MatchEvent {
+  return { t: 'dart', seg, src, at: Date.now(), ...(x !== undefined && y !== undefined ? { x, y } : {}), ...extra };
 }
 
 // ------------------------------------------------------------------ board integration
@@ -290,13 +291,35 @@ boardEvents.on('dart', async (boardId: string, dart: DetectedDart) => {
   if (!matchId) return;
   const m = await load(matchId);
   if (!m || m.row.status !== 'running') return;
-  const seg = Number.isFinite(dart.x) && Number.isFinite(dart.y) ? scoreFromCoords(dart.x, dart.y) : dart.seg;
+  const bounce = dart.out === 'bounce';
+  const hasPos = !bounce && Number.isFinite(dart.x) && Number.isFinite(dart.y);
+  const seg = bounce ? MISS : hasPos ? scoreFromCoords(dart.x!, dart.y!) : dart.seg;
+  const extra = { ...(typeof dart.id === 'string' ? { bid: dart.id } : {}), ...(bounce ? { out: 'bounce' as const } : {}) };
   await mutate(m, (events, state) =>
     // remote play: only the board of the player whose turn it is counts
     state.awaitingNext || state.finished || playerBoard(m.row, state.currentPlayer) !== boardId
       ? null
-      : [...events, dartEvent(seg, 'board', dart.x, dart.y)],
+      : [...events, dartEvent(seg, 'board', hasPos ? dart.x : undefined, hasPos ? dart.y : undefined, extra)],
   ).catch(() => undefined);
+});
+
+/**
+ * Official rule: a dart that falls out of the board before it is retrieved does not score. Only darts
+ * of the turn that is still on the board (no "next" after them) and that nobody corrected by hand.
+ */
+boardEvents.on('dart_out', async (boardId: string, dartId: string) => {
+  const matchId = activeByBoard.get(boardId);
+  if (!matchId) return;
+  const m = await load(matchId);
+  if (!m || m.row.status !== 'running') return;
+  await mutate(m, (events) => {
+    const index = events.findIndex((e) => e.t === 'dart' && e.bid === dartId);
+    const ev = events[index];
+    if (!ev || ev.t !== 'dart' || ev.src !== 'board' || ev.out || events.slice(index + 1).some((e) => e.t === 'next')) return null;
+    const copy = events.slice();
+    copy[index] = { ...ev, seg: MISS, out: 'fall' };
+    return copy;
+  }).catch(() => undefined);
 });
 
 boardEvents.on('takeout_finished', async (boardId: string) => {

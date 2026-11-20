@@ -191,6 +191,7 @@ class BoardApp:
                     "fps": round(s.measured_fps, 1),
                     "ok": bool(s.ok),
                     "calibrated": s.index in self.detector.cams,
+                    "issue": self.detector.camera_issue(s.index),
                 }
             )
         state = self.detector.public_state()
@@ -203,6 +204,17 @@ class BoardApp:
             message = "Bitte mindestens eine Kamera kalibrieren."
         elif not all(c["calibrated"] for c in cams):
             message = "Nicht alle Kameras sind kalibriert – die Genauigkeit ist reduziert."
+        mirrored = [str(c["index"] + 1) for c in cams if c["issue"] == "mirrored"]
+        odd = [str(c["index"] + 1) for c in cams if c["issue"] == "inconsistent"]
+        if mirrored:
+            message = (message + " " if message else "") + (
+                f"Kalibrierung von Kamera {', '.join(mirrored)} ist spiegelverkehrt (Punkte vertauscht) und wird ignoriert – "
+                "bitte neu kalibrieren: „Automatisch erkennen“ und auf die 20 tippen."
+            )
+        if odd:
+            message = (message + " " if message else "") + (
+                f"Kamera {', '.join(odd)} liegt bei vielen Würfen neben den anderen Kameras – Kalibrierung prüfen."
+            )
         if self.detector.dark:
             message = (message + " " if message else "") + "Zu dunkel – die Erkennung wartet auf Licht (Kalibrierung bleibt gespeichert)."
         if self.sim is not None:
@@ -562,8 +574,15 @@ class BoardApp:
             if kind == "dart":
                 dart = ev[1]
                 self.last_dart = {**dart, "label": segment_label(dart["seg"]["number"], dart["seg"]["multiplier"]), "at": time.time()}
-                log.info("dart %s at (%.1f, %.1f) cams=%s conf=%.2f", self.last_dart["label"], dart["x"], dart["y"], dart["cameras"], dart["confidence"])
+                if dart.get("out") == "bounce":
+                    log.info("dart bounced out -> MISS")
+                else:
+                    log.info("dart %s at (%.1f, %.1f) cams=%s conf=%.2f", self.last_dart["label"], dart["x"], dart["y"], dart["cameras"], dart["confidence"])
                 await self.send_event({"type": "dart", "dart": dart})
+            elif kind == "dart_out":
+                if self.last_dart and self.last_dart.get("id") == ev[1]:
+                    self.last_dart = {**self.last_dart, "out": "fall"}
+                await self.send_event({"type": "dart_out", "id": ev[1]})
             elif kind in ("takeout_started", "takeout_finished"):
                 log.info(kind)
                 await self.send_event({"type": kind})

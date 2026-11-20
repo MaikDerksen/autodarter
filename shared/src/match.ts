@@ -55,6 +55,13 @@ export interface PlayerInfo {
 
 export type DartSource = 'board' | 'manual';
 
+/**
+ * Official rule: a dart that bounces out (hits the board and drops) or falls out before the player
+ * retrieves it does not score, but counts as thrown. bounce: reported by the board as a MISS without
+ * position; fall: detected normally, fell out later (its segment is replaced by MISS).
+ */
+export type DartOut = 'bounce' | 'fall';
+
 export interface DartEvent {
   t: 'dart';
   seg: Segment;
@@ -62,6 +69,10 @@ export interface DartEvent {
   y?: number;
   src: DartSource;
   at: number;
+  /** id of the board detection (to find the dart again when it falls out) */
+  bid?: string;
+  /** bounced out / fell out of the board: counts as thrown, scores nothing (seg is MISS) */
+  out?: DartOut;
 }
 
 export interface NextEvent {
@@ -81,6 +92,8 @@ export interface DartView {
   eventIndex: number;
   /** Around the Clock: the dart hit the target number. */
   hit?: boolean;
+  /** bounced out / fell out of the board (MISS by rule) */
+  out?: DartOut;
 }
 
 export interface TurnView {
@@ -509,6 +522,7 @@ export function computeMatch(settings: MatchSettings, players: PlayerInfo[], eve
       if (turn.complete) return;
       // the dart belongs to the turn before it is scored, so a leg-winning dart is counted (darts, average, best leg)
       const view: DartView = { seg: ev.seg, label: segmentLabel(ev.seg), points: 0, x: ev.x, y: ev.y, src: ev.src, eventIndex: idx };
+      if (ev.out) view.out = ev.out;
       turn.darts.push(view);
       const pts =
         settings.mode === 'x01' ? applyX01Dart(ev.seg) : settings.mode === 'atc' ? applyAtcDart(ev.seg) : applyCricketDart(ev.seg);

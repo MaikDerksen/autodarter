@@ -34,6 +34,8 @@ class Settings:
     minDartArea: int = 40
     takeoutArea: int = 6000
     settleFrames: int = 3
+    # official rule: a dart that bounces out (hits the board and drops) counts as thrown, without score
+    bounceOut: int = 1
 
     def update(self, data: dict) -> None:
         for key, value in data.items():

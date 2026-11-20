@@ -3,6 +3,7 @@ import {
   BOARD,
   CALIBRATION_POINTS,
   applyHomography,
+  calibrationMirrored,
   computeHomography,
   computeMatch,
   parseSegment,
@@ -251,5 +252,52 @@ describe('statistics', () => {
     expect(st.stats[0].dartsThrown).toBe(3);
     expect(st.stats[0].average).toBe(101);
     expect(st.stats[0].bestLegDarts).toBe(3);
+  });
+});
+
+describe('calibration orientation', () => {
+  // a camera that looks at the board from below and a bit to the side (image y points down)
+  const H = computeHomography(
+    [
+      { x: -170, y: 170 },
+      { x: 170, y: 170 },
+      { x: 170, y: -170 },
+      { x: -170, y: -170 },
+    ],
+    [
+      { x: 380, y: 160 },
+      { x: 900, y: 140 },
+      { x: 1010, y: 560 },
+      { x: 260, y: 600 },
+    ],
+  )!;
+  const points = CALIBRATION_POINTS.map((p) => {
+    const q = applyHomography(H, p);
+    return { x: q.x / 1280, y: q.y / 720 };
+  });
+
+  it('accepts points as a camera in front of the board sees them', () => {
+    expect(calibrationMirrored(points)).toBe(false);
+  });
+
+  it('detects swapped points (mirrored calibration)', () => {
+    expect(calibrationMirrored([points[1], points[0], points[3], points[2], points[4]])).toBe(true);
+    expect(calibrationMirrored([points[3], points[2], points[1], points[0], points[4]])).toBe(true);
+    expect(calibrationMirrored(null)).toBe(false);
+  });
+});
+
+describe('darts that bounce or fall out', () => {
+  it('count as thrown, score nothing and keep their reason', () => {
+    const settings: MatchSettings = { mode: 'x01', startScore: 301, inMode: 'straight', outMode: 'double', legs: 1 };
+    const ev: MatchEvent[] = [
+      { t: 'dart', seg: parseSegment('T20'), src: 'board', at: 1, bid: 'a' },
+      { t: 'dart', seg: parseSegment('MISS'), src: 'board', at: 2, out: 'bounce' },
+      { t: 'dart', seg: parseSegment('MISS'), src: 'board', at: 3, bid: 'c', out: 'fall', x: 10, y: 120 },
+    ];
+    const st = computeMatch(settings, players, ev);
+    expect(st.turn.darts.map((d) => d.out ?? null)).toEqual([null, 'bounce', 'fall']);
+    expect(st.turn.points).toBe(60);
+    expect(st.turn.complete).toBe(true);
   });
 });

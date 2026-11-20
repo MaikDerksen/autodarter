@@ -107,6 +107,22 @@ def test_full_without_hint_asks_for_the_20():
     assert "20" in res["message"]
 
 
+def test_mirrored_prior_is_not_taken_over():
+    # two points swapped (20|1 <-> 6|10, 3|19 <-> 11|14): rings and wires fit perfectly, but every
+    # position is mirrored. Refining it would keep the mistake -> search again and ask for the 20.
+    for cam in range(3):
+        truth = world().calibration(cam)
+        mirrored = [truth[1], truth[0], truth[3], truth[2], truth[4]]
+        assert g.calibration_mirrored(mirrored) and not g.calibration_mirrored(truth)
+        res = auto_calibrate(frame(cam), prior=mirrored)
+        assert not res["ok"] and res["needsHint"] and "spiegelverkehrt" in res["message"], res
+        assert not g.calibration_mirrored(res["points"])
+        res = auto_calibrate(frame(cam), prior=mirrored, hint20=hint20(truth))
+        assert res["ok"] and not res["needsHint"], res
+        mean, worst = ring_error(res["points"], truth)
+        assert mean < 0.8 and worst < 1.5, (cam, mean, worst)
+
+
 def test_hint_must_not_be_on_the_bull():
     truth = world().calibration(0)
     p = g.apply_h(g.board_to_image_homography(truth, W, H), [(0.0, 3.0)])[0]

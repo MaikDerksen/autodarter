@@ -36,10 +36,14 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - **Freunde spielen gerade**: Läuft bei einem Freund ein Spiel, steht es oben auf „Spielen“. In der ersten Runde kannst du mit „Mitspielen“ noch einsteigen (du wirfst als Letzter der Runde, am Board des Spiels oder per „Remote spielen“ an deinem eigenen), danach kannst du zuschauen.
 - **Kameras live ansehen**: Livebild aller Kameras in der App, mit eingeblendetem Board-Raster der Kalibrierung und der erkannten Dartspitze
 - **Kamera-Ansicht im Spiel** wie bei Autodarts: *Virtuell · Kamera 1 · Kamera 2 · Kamera 3*. Das Kamerabild wird mit der Kalibrierung **entzerrt**, so dass das Board frontal erscheint (statt schräg von der Seite). Würfe werden darauf markiert, und du kannst auch dort zum Korrigieren tippen.
+  - Die Markierungen sitzen in jeder Ansicht an der **Spitze** (dort, wo der Dart im Board steckt). Der Rest des Darts ragt aus dem Board und erscheint im entzerrten Bild deshalb als langer Strich, der von der Kamera weg zeigt.
+  - Passen Bild und Markierungen in einer Kamera nicht zusammen (z. B. spiegelverkehrte Zahlen), ist ihre Kalibrierung falsch – siehe unten.
 - **Status-Ring** um das Board: grün = werfen, orange = Darts ziehen, rot = Board offline/gestoppt
 - **Kalibrieren** wie bei Autodarts: Pro Kamera ziehst du 4 Punkte auf die Außenkante des Doppelrings (20|1, 6|10, 3|19, 11|14), dazu einen 5. Punkt auf das Bull.
   - **Automatisch erkennen**: Der Pi sucht das Board selbst im Kamerabild und setzt die Punkte. Gibt es schon eine Kalibrierung (oder hast du die Punkte grob gesetzt), wird sie nur nachgezogen. Sonst fragt die App einmal, wo die 20 ist. Du prüfst das Netz und speicherst.
-  - Das Board-Raster wird dabei live projiziert.
+  - Das Board-Raster wird dabei live projiziert, dazu die **Sektorzahlen in Gelb**: Sie müssen auf den gedruckten Zahlen des Boards stehen. So fällt eine verdrehte Kalibrierung sofort auf.
+  - **Spiegelverkehrt-Schutz**: Sind zwei Punkte vertauscht (z. B. „20 | 1“ mit „6 | 10“ und „3 | 19“ mit „11 | 14“), passt das Netz trotzdem perfekt auf die Drähte – aber jeder Dart dieser Kamera würde gespiegelt gezählt. Die App lässt so eine Kalibrierung nicht mehr speichern, „Automatisch erkennen“ übernimmt sie nicht und fragt nach der 20. Ist eine gespiegelte Kalibrierung schon gespeichert, ignoriert das Board diese Kamera und zeigt eine rote Warnung auf der Board-Seite und im Spiel.
+  - Liegt eine Kamera bei vielen Würfen neben den anderen beiden, meldet das Board das ebenfalls („Kalibrierung prüfen“).
   - Zum Feinjustieren gibt es eine Lupe, Pfeiltasten und Pfeil-Buttons.
   - **Bleibt gespeichert**: pro USB-Anschluss auf dem Pi (`data/calibration.json`) und als Sicherung auf dem Server. Licht aus, Neustart, kurz abgezogene Kamera – die Kalibrierung bleibt, bis du sie selbst neu setzt. Verliert der Pi seinen `data`-Ordner, holt er sie sich vom Server zurück.
   - **Licht aus/an**: Im Dunkeln pausiert die Erkennung („Zu dunkel“), beim Einschalten wartet sie kurz, bis sich die Kameras eingeregelt haben. So entstehen keine Phantom-Darts.
@@ -48,6 +52,9 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Würfe aus allen Kameras werden zusammengeführt.
   - Takeout (Hand am Board) wird erkannt und schaltet zum nächsten Spieler weiter.
   - Bewegt sich eine Hand am Board, ohne Darts zu ziehen, bleibt der Zustand erhalten.
+  - **Abpraller und rausgefallene Darts** (offizielle Regel: zählt als geworfen, aber ohne Punkte):
+    - Fällt ein Dart vor dem Ziehen aus dem Board – auch während der nächste einschlägt –, wird er nachträglich zu **Miss** („rausgefallen“), seine Markierung bleibt grau stehen.
+    - Trifft ein Dart das Board und fällt sofort herunter, meldet das Board einen **Miss** („Abpraller“). Das lässt sich unter *Erkennungs-Einstellungen → Abpraller als Miss* abschalten, falls Bewegungen direkt vor dem Board fälschlich als Abpraller gezählt werden. Ein Dart, der das Board ganz verfehlt, ist für die Kameras oft unsichtbar – den bitte als Miss eintippen.
 - **Spielmodi**:
   - **X01** (301/501): Straight-, Double- oder Master-In und -Out, Bust-Regel, Legs („First to N“), Checkout-Vorschläge
   - **Cricket**: Standard oder Cut-Throat, Rundenlimit
@@ -277,6 +284,8 @@ Unter **Spielen** 301 / 501 / Cricket / Around the Clock wählen, Spieler hinzuf
 4. Über die Kalibrier-Homographie wird diese Achse auf die Board-Ebene abgebildet. Die Spitze liegt **garantiert auf dieser Linie**, auch wenn die dünne Stahlspitze im Bild nicht zu sehen ist.
 5. Die Linien aller Kameras werden robust geschnitten: das beste konsistente Kamerapaar, danach Ausgleichsrechnung über alle passenden Kameras. Daraus ergeben sich Position (mm) und Segment.
 6. Takeout: Eine große Änderung bedeutet „Hand am Board“. Wird das Bild danach wieder ruhig und hat sich etwas verändert, ist der Takeout beendet. Hat sich nichts verändert, bleibt der alte Zustand erhalten.
+7. Rausgefallen: Zeigen die Pixel eines Darts dieser Aufnahme wieder das leere Board, ist er herausgefallen. Diese Stelle zählt auch nicht als neuer Dart.
+8. Abpraller: Eine kurze, dart-große Bewegung, die mindestens zwei Kameras sehen und die nichts im Board hinterlässt (nicht direkt nach dem Ziehen).
 
 Ergebnis im Simulator mit 240 Würfen auf 3 Kameras (die Hälfte mit absichtlich 2 px Kalibrierfehler):
 
@@ -337,6 +346,6 @@ Der Pi speichert seine Board-ID, das Board-Secret, die Kalibrierung (pro USB-Por
 ## Grenzen und nächste Schritte
 
 - Die Erkennung ist klassische Bildverarbeitung, kein neuronales Netz. Sie ist im Simulator validiert, aber **noch nicht an einem echten Board getestet**. Die Schwellwerte lassen sich in der App anpassen.
-- Bounce-outs werden noch nicht gemeldet. Zwei Darts im selben Bewegungsfenster werden als einer gewertet.
+- Zwei Darts im selben Bewegungsfenster werden als einer gewertet. Ein Dart, der das Board komplett verfehlt, wird meist nicht gesehen.
 - Es gibt noch keine weiteren Spielmodi wie Shanghai oder Bob's 27. Die event-basierte Engine ist aber darauf ausgelegt.
 - Neue Boards können sich ohne Login am Server melden (sie erscheinen erst nach der Kopplung in einem Konto). Unbenutzte, nicht gekoppelte Boards werden nach 30 Tagen gelöscht.

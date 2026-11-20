@@ -20,7 +20,9 @@ Pipeline
      (on real boards the colour edge sits up to a wire width beside the nominal radius); the outer
      double edge keeps the scale. Score: share of the detected edges within 1.5 px of the fit.
 
-Assumes an unmirrored camera image (a mirrored one is only handled via a mirrored ``prior``).
+Assumes an unmirrored camera image (like every V4L2 camera delivers it). A ``prior`` in mirrored
+order (two calibration points swapped - the rings and wires fit, every position is mirrored) is
+ignored: the board is searched from scratch and the result asks for ``hint20``.
 A prior that is rotated by about a whole colour period (36 deg) cannot be told apart from the
 right one; from ~12 deg on the result asks for ``hint20`` instead of guessing.
 """
@@ -762,7 +764,7 @@ def auto_calibrate(
         return _result(False, None, w, h, 0.0, mode, False, "Kein Kamerabild.")
     fr = _Frame(frame_bgr)
 
-    prior_H, prior_px = None, None
+    prior_H, prior_px, prior_mirrored = None, None, False
     if prior is not None:
         try:
             # edge coordinates of the app -> pixel-centre convention of OpenCV
@@ -774,6 +776,8 @@ def auto_calibrate(
             prior_H = None
         if prior_H is not None and not np.all(np.isfinite(prior_H)):
             prior_H = None
+        if prior_H is not None and g.calibration_mirrored(pr):
+            prior_H, prior_px, prior_mirrored = None, None, True
     hint_px = None
     if hint20 is not None:
         try:
@@ -787,6 +791,8 @@ def auto_calibrate(
         score = st["score"]
         cands = _candidates(H)
         k, needs, msg = _guess_up(cands), True, "Board gefunden – tippe einmal auf die 20, damit die Ausrichtung stimmt."
+        if prior_mirrored:
+            msg = "Board gefunden. Die alte Kalibrierung war spiegelverkehrt (Punkte vertauscht) – tippe einmal auf die 20."
         if hint_px is not None and _hint_angle(H, hint_px)[1] >= _MIN_HINT_R:
             k = int(np.argmin([abs(float(_wrap(_hint_angle(Hk, hint_px)[0] - 90.0))) for Hk in cands]))
             needs = False

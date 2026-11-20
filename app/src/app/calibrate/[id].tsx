@@ -3,8 +3,8 @@ import { router, Stack, useLocalSearchParams } from 'expo-router';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Image, Platform, Pressable, StyleSheet, Text, useWindowDimensions, View, type GestureResponderEvent } from 'react-native';
 import Svg, { Circle, G, Line, Path, Text as SvgText } from 'react-native-svg';
-import { CALIBRATION_POINTS, type AutoCalibration, type BoardSummary, type Point } from '@shared';
-import { boardToImage, wireframePath } from '@/components/BoardOverlay';
+import { CALIBRATION_POINTS, calibrationMirrored, type AutoCalibration, type BoardSummary, type Point } from '@shared';
+import { boardToImage, SectorNumbers, wireframePath } from '@/components/BoardOverlay';
 import { Button, Card, ErrorText, H2, Loading, P, Row, Screen } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
 import { colors, radius } from '@/lib/theme';
@@ -70,10 +70,10 @@ export default function CalibrateScreen() {
   const imgW = Math.min(screenWidth - 64, 1200);
   const imgH = snap ? (imgW * snap.height) / snap.width : imgW * (9 / 16);
 
-  const wire = useMemo(() => {
-    const H = boardToImage(points, imgW, imgH);
-    return H ? wireframePath(H) : null;
-  }, [points, imgW, imgH]);
+  const H = useMemo(() => boardToImage(points, imgW, imgH), [points, imgW, imgH]);
+  const wire = useMemo(() => (H ? wireframePath(H) : null), [H]);
+  /** points in mirrored order (two swapped): rings and wires fit, but every dart would be mirrored */
+  const mirrored = calibrationMirrored(points);
 
   const setPoint = useCallback((index: number, p: Point) => {
     setPoints((pts) => pts.map((q, i) => (i === index ? { x: Math.min(1, Math.max(0, p.x)), y: Math.min(1, Math.max(0, p.y)) } : q)));
@@ -164,6 +164,10 @@ export default function CalibrateScreen() {
   };
 
   const save = async () => {
+    if (mirrored) {
+      setError('Die Punkte sind spiegelverkehrt – so kann nicht gespeichert werden (siehe Hinweis oben).');
+      return;
+    }
     setBusy('save');
     setError(null);
     try {
@@ -189,7 +193,7 @@ export default function CalibrateScreen() {
           <P muted>
             Ziehe jeden farbigen Punkt exakt auf die äußere Kante des Doppelrings an der jeweiligen Segmentgrenze (z. B. „20 | 1“ = Draht zwischen 20 und 1)
             und den Bull-Punkt in die Mitte des Bullseye. Das grüne Netz zeigt live, wie das Board aus Sicht dieser Kamera erkannt wird – es muss genau auf
-            den Drähten liegen. Tippen auf eine freie Stelle setzt den ausgewählten Punkt dorthin. Feinjustierung: Pfeiltasten (Shift = 10 px) oder Buttons.
+            den Drähten liegen, und die gelben Zahlen müssen auf den Zahlen des Boards stehen. Tippen auf eine freie Stelle setzt den ausgewählten Punkt dorthin. Feinjustierung: Pfeiltasten (Shift = 10 px) oder Buttons.
           </P>
           <Row wrap style={{ alignItems: 'center' }}>
             <Button title="Automatisch erkennen" icon="scan" onPress={() => runAuto()} loading={busy === 'auto'} disabled={!snap && busy === 'snapshot'} />
@@ -208,9 +212,19 @@ export default function CalibrateScreen() {
                 {auto.ok
                   ? `Automatisch erkannt (Qualität ${Math.round(auto.score * 100)} %). Prüfe das Netz und speichere.`
                   : pickHint
-                    ? 'Board gefunden. Tippe jetzt im Kamerabild einmal auf das Feld der 20 – dann weiß die Erkennung, wie das Board gedreht ist.'
+                    ? `${auto.message.includes('spiegelverkehrt') ? 'Die alte Kalibrierung war spiegelverkehrt (Punkte vertauscht). ' : ''}Board gefunden. Tippe jetzt im Kamerabild einmal auf das Feld der 20 – dann weiß die Erkennung, wie das Board gedreht ist.`
                     : auto.message || 'Board nicht sicher erkannt – bitte von Hand kalibrieren.'}
                 {auto.ok && auto.message ? ` ${auto.message}` : ''}
+              </Text>
+            </View>
+          ) : null}
+          {mirrored ? (
+            <View style={[st.autoInfo, { borderColor: colors.danger }]}>
+              <Ionicons name="warning" size={20} color={colors.danger} />
+              <Text style={{ color: colors.text, flex: 1 }}>
+                Die Punkte sind spiegelverkehrt: Zwei Punkte sind vertauscht (z. B. „20 | 1“ mit „6 | 10“ und „3 | 19“ mit „11 | 14“). Das Netz liegt dann
+                trotzdem auf den Drähten, aber jeder Dart würde gespiegelt gezählt. Die gelben Zahlen müssen auf den Zahlen des Boards liegen – am
+                einfachsten „Automatisch erkennen“ drücken und auf die 20 tippen.
               </Text>
             </View>
           ) : null}
@@ -237,7 +251,8 @@ export default function CalibrateScreen() {
             <View style={{ width: imgW, height: imgH, borderRadius: radius.md, overflow: 'hidden', backgroundColor: '#000' }}>
               <Image source={{ uri: imageUri! }} style={{ width: imgW, height: imgH }} resizeMode="stretch" />
               <Svg width={imgW} height={imgH} style={StyleSheet.absoluteFill} pointerEvents="none">
-                {wire ? <Path d={wire} stroke="#22c55e" strokeWidth={1.3} fill="none" opacity={0.9} /> : null}
+                {wire ? <Path d={wire} stroke={mirrored ? colors.danger : '#22c55e'} strokeWidth={1.3} fill="none" opacity={0.9} /> : null}
+                <SectorNumbers H={H} size={Math.max(10, Math.min(15, imgW / 70))} color={mirrored ? colors.danger : '#facc15'} />
                 {points.map((p, i) => (
                   <G key={i}>
                     <Circle cx={p.x * imgW} cy={p.y * imgH} r={selected === i ? 11 : 8} stroke={POINT_COLORS[i]} strokeWidth={3} fill="none" />
@@ -308,7 +323,7 @@ export default function CalibrateScreen() {
 
         <ErrorText>{snap ? error : null}</ErrorText>
         <Row wrap>
-          <Button title="Speichern" icon="checkmark" onPress={save} loading={busy === 'save'} disabled={!snap} />
+          <Button title="Speichern" icon="checkmark" onPress={save} loading={busy === 'save'} disabled={!snap || mirrored} />
           <Button title="Neues Bild" variant="secondary" icon="camera" onPress={loadSnapshot} loading={busy === 'snapshot'} />
           <Button
             title="Punkte zurücksetzen"

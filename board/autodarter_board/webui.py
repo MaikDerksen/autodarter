@@ -37,7 +37,7 @@ button.sec{background:#1a232e;color:var(--text);border:1px solid var(--line)}
 <div class="card"><div class="row" style="justify-content:space-between"><h2>Erkennung</h2><span id="state" class="pill">…</span></div>
 <p id="msg" class="muted"></p><p id="dart"></p>
 <div class="row"><button class="sec" onclick="cmd('start')">Start</button><button class="sec" onclick="cmd('stop')">Stopp</button><button class="sec" onclick="cmd('reset')">Reset</button><button class="sec" onclick="if(confirm('Board-Client neu starten?'))cmd('restart')">Neu starten</button>
-<span id="simctl" style="display:none" class="row"><button onclick="sim('throw')">🎯 Sim: Dart werfen</button><button class="sec" onclick="sim('takeout')">✋ Sim: Darts ziehen</button></span></div></div>
+<span id="simctl" style="display:none" class="row"><button onclick="sim('throw')">🎯 Sim: Dart werfen</button><button class="sec" onclick="sim('bounce')">↩️ Sim: Abpraller</button><button class="sec" onclick="sim('fallout')">⬇️ Sim: Dart fällt raus</button><button class="sec" onclick="sim('takeout')">✋ Sim: Darts ziehen</button></span></div></div>
 <div class="card"><h2>Kameras</h2><div class="cams" id="cams"></div></div>
 </main><script>
 let serverSet=false;
@@ -55,7 +55,8 @@ async function refresh(){
     const st=document.getElementById('state');st.textContent=s.status.state+' · '+s.status.darts+' Darts · '+s.status.fps+' FPS';
     st.className='pill '+(s.status.state==='throw'?'ok':(s.status.state.startsWith('takeout')?'warn':'bad'));
     document.getElementById('msg').textContent=s.status.message||'';
-    document.getElementById('dart').innerHTML=s.lastDart?('Letzter Dart: <b>'+s.lastDart.label+'</b> ('+s.lastDart.x.toFixed(1)+' / '+s.lastDart.y.toFixed(1)+' mm, Kameras '+s.lastDart.cameras.map(x=>x+1).join(',')+')'):'';
+    const d=s.lastDart;
+    document.getElementById('dart').innerHTML=!d?'':d.out==='bounce'?'Letzter Dart: <b>MISS</b> (Abpraller)':('Letzter Dart: <b>'+(d.out==='fall'?'MISS</b> (rausgefallen, war '+d.label+')':d.label+'</b>')+' ('+d.x.toFixed(1)+' / '+d.y.toFixed(1)+' mm, Kameras '+d.cameras.map(x=>x+1).join(',')+')');
     document.getElementById('simctl').style.display=s.sim?'flex':'none';
     const cams=document.getElementById('cams');
     if(cams.children.length!==s.status.cameras.length){cams.innerHTML=s.status.cameras.map(c=>'<div><img data-i="'+c.index+'"><div class="muted" id="cam'+c.index+'"></div></div>').join('');}
@@ -131,6 +132,21 @@ async def start_webui(app) -> web.AppRunner:
         data = await req.json() if req.can_read_body else {}
         x, y = app.sim.throw(data.get("x"), data.get("y"))
         return web.json_response({"x": x, "y": y})
+
+    @routes.post("/api/sim/bounce")
+    async def sim_bounce(req):
+        if app.sim is None:
+            raise web.HTTPNotFound()
+        data = await req.json() if req.can_read_body else {}
+        x, y = app.sim.bounce(data.get("x"), data.get("y"))
+        return web.json_response({"x": x, "y": y})
+
+    @routes.post("/api/sim/fallout")
+    async def sim_fallout(req):
+        if app.sim is None:
+            raise web.HTTPNotFound()
+        data = await req.json() if req.can_read_body else {}
+        return web.json_response({"ok": app.sim.fall_out(int(data.get("index", 0)))})
 
     @routes.post("/api/sim/takeout")
     async def sim_takeout(_req):

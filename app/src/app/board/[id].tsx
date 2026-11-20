@@ -6,7 +6,7 @@ import { segmentLabel, type BoardMember, type BoardSettings, type BoardSummary, 
 import { BoardOverlay } from '@/components/BoardOverlay';
 import { Dartboard } from '@/components/Dartboard';
 import { OnlineDot } from '@/components/OnlineDot';
-import { Badge, Button, Card, ErrorText, Field, H2, Loading, P, Row, Screen, Stat } from '@/components/ui';
+import { Badge, Button, Card, ErrorText, Field, H2, Loading, P, Row, Screen, Segmented, Stat } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
 import { useAuth } from '@/lib/auth';
 import { boardBadge } from '@/lib/boardState';
@@ -138,8 +138,18 @@ function CameraTile({
             <Text style={{ color: colors.faint }}>{cam.ok ? 'Warte auf Bild …' : 'Kamera nicht verfügbar'}</Text>
           </View>
         )}
-        <BoardOverlay points={calibration?.points} width={width} height={height} tip={tip} />
+        <BoardOverlay points={calibration?.points} width={width} height={height} tip={tip} numbers />
       </View>
+      {cam.issue ? (
+        <View style={s.camIssue}>
+          <Ionicons name="warning" size={16} color={colors.danger} />
+          <Text style={{ color: colors.text, flex: 1, fontSize: 13 }}>
+            {cam.issue === 'mirrored'
+              ? 'Kalibrierung spiegelverkehrt: zwei Punkte sind vertauscht, die gelben Zahlen liegen nicht auf den Zahlen des Boards. Diese Kamera wird ignoriert – neu kalibrieren („Automatisch erkennen“, dann auf die 20 tippen).'
+              : 'Diese Kamera liegt bei vielen Würfen neben den anderen – Kalibrierung prüfen (die gelben Zahlen müssen auf den Zahlen des Boards liegen).'}
+          </Text>
+        </View>
+      ) : null}
       <Row style={{ justifyContent: 'space-between' }} wrap>
         <View style={{ flexShrink: 1 }}>
           <Text style={{ color: colors.text, fontWeight: '700' }}>
@@ -150,7 +160,10 @@ function CameraTile({
           </Text>
         </View>
         <Row gap={6}>
-          <Badge label={cam.calibrated ? 'Kalibriert' : 'Nicht kalibriert'} color={cam.calibrated ? colors.accent : colors.warning} />
+          <Badge
+            label={cam.issue === 'mirrored' ? 'Gespiegelt' : cam.calibrated ? 'Kalibriert' : 'Nicht kalibriert'}
+            color={cam.issue ? colors.danger : cam.calibrated ? colors.accent : colors.warning}
+          />
           <Button small variant="secondary" icon="locate" title="Kalibrieren" onPress={() => router.push(`/calibrate/${board.id}?cam=${cam.index}`)} />
         </Row>
       </Row>
@@ -191,6 +204,7 @@ export default function BoardScreen() {
   if (board?.settings) {
     for (const f of SETTING_FIELDS) fromBoard[f.key] = String(board.settings[f.key]);
     fromBoard.resolution = board.settings.resolution.join('x');
+    fromBoard.bounceOut = String(board.settings.bounceOut ?? 1);
   }
   const settings = edited ?? fromBoard;
 
@@ -228,6 +242,7 @@ export default function BoardScreen() {
       }
       const res = /^(\d+)\s*[x×]\s*(\d+)$/.exec(settings.resolution ?? '');
       if (res) body.resolution = [Number(res[1]), Number(res[2])];
+      if (board.settings && 'bounceOut' in board.settings) body.bounceOut = settings.bounceOut === '0' ? 0 : 1;
       await api(`/api/boards/${id}/settings`, { method: 'PUT', body });
     });
 
@@ -376,15 +391,29 @@ export default function BoardScreen() {
           <H2>Erkennungstest</H2>
           <P muted>Wirf einen Dart – hier siehst du sofort, was erkannt wurde (auch ohne laufendes Spiel).</P>
           <Row wrap gap={20} style={{ alignItems: 'flex-start' }}>
-            <Dartboard size={Math.min(300, contentWidth)} hits={dart ? [{ x: dart.x, y: dart.y, color: '#ef4444' }] : []} />
+            <Dartboard
+              size={Math.min(300, contentWidth)}
+              hits={dart && dart.x !== undefined && dart.y !== undefined ? [{ x: dart.x, y: dart.y, color: dart.out ? '#6b7280' : '#ef4444' }] : []}
+            />
             <View style={{ gap: 8, flex: 1, minWidth: 200 }}>
               {dart ? (
                 <>
-                  <Text style={{ color: colors.text, fontSize: 40, fontWeight: '900' }}>{segmentLabel(dart.seg)}</Text>
-                  <P muted>
-                    Position: x {dart.x.toFixed(1)} mm, y {dart.y.toFixed(1)} mm{'\n'}
-                    Kameras: {dart.cameras.map((c) => c + 1).join(', ')} · Sicherheit {(dart.confidence * 100).toFixed(0)} %
-                  </P>
+                  <Text style={{ color: colors.text, fontSize: 40, fontWeight: '900' }}>{dart.out ? 'MISS' : segmentLabel(dart.seg)}</Text>
+                  {dart.out ? (
+                    <Badge
+                      label={dart.out === 'bounce' ? 'Abpraller' : `Rausgefallen (war ${segmentLabel(dart.seg)})`}
+                      color={colors.warning}
+                      icon="arrow-down"
+                    />
+                  ) : null}
+                  {dart.x !== undefined && dart.y !== undefined ? (
+                    <P muted>
+                      Position: x {dart.x.toFixed(1)} mm, y {dart.y.toFixed(1)} mm{'\n'}
+                      Kameras: {dart.cameras.map((c) => c + 1).join(', ')} · Sicherheit {(dart.confidence * 100).toFixed(0)} %
+                    </P>
+                  ) : (
+                    <P muted>Der Dart hat das Board getroffen und ist gleich wieder herausgefallen.</P>
+                  )}
                 </>
               ) : (
                 <P muted>Noch kein Dart erkannt.</P>
@@ -422,6 +451,25 @@ export default function BoardScreen() {
               </View>
             ))}
           </View>
+          {board.settings && 'bounceOut' in board.settings ? (
+            <View style={{ gap: 6 }}>
+              <Text style={{ color: colors.text, fontWeight: '700' }}>Abpraller als Miss</Text>
+              <Segmented
+                style={{ alignSelf: 'flex-start' }}
+                options={[
+                  { value: '1', label: 'An' },
+                  { value: '0', label: 'Aus' },
+                ]}
+                value={settings.bounceOut === '0' ? '0' : '1'}
+                onChange={(v) => setSettings({ ...settings, bounceOut: v })}
+              />
+              <Text style={{ color: colors.faint, fontSize: 12 }}>
+                Offizielle Regel: Ein Dart, der abprallt oder vor dem Ziehen aus dem Board fällt, zählt als geworfen, aber ohne Punkte. Rausgefallene
+                Darts werden immer zu Miss. Kurz aufschlagen und runterfallen erkennt das Board als Abpraller – falls es sich dabei irrt (z. B. durch
+                Bewegungen direkt vor dem Board), hier ausschalten.
+              </Text>
+            </View>
+          ) : null}
           <Button title="Einstellungen speichern" icon="save" onPress={saveSettings} loading={busy === 'settings'} disabled={!owner || !board.online} />
         </Card>
 
@@ -472,6 +520,16 @@ export default function BoardScreen() {
 const s = StyleSheet.create({
   camBox: { backgroundColor: '#000', borderRadius: radius.md, overflow: 'hidden', borderWidth: 1, borderColor: colors.border },
   camPlaceholder: { flex: 1, alignItems: 'center', justifyContent: 'center', gap: 8 },
+  camIssue: {
+    flexDirection: 'row',
+    gap: 8,
+    alignItems: 'flex-start',
+    padding: 10,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.danger + '88',
+    backgroundColor: colors.dangerDim,
+  },
   activeRow: { backgroundColor: '#2a1f05', borderRadius: radius.md, padding: 10, borderWidth: 1, borderColor: colors.warning + '66' },
   memberRow: { flexDirection: 'row', alignItems: 'center', gap: 10, padding: 10, borderRadius: radius.md, backgroundColor: colors.bg },
   codeBox: {

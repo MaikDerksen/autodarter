@@ -65,6 +65,24 @@ def segment_label(number: int, multiplier: int) -> str:
     return ("T" if multiplier == 3 else "D") + str(number)
 
 
+def calibration_mirrored(points_norm) -> bool:
+    """True if the four outer calibration points lie in mirrored order in the image.
+
+    A camera in front of the board always sees 20|1 -> 6|10 -> 3|19 -> 11|14 clockwise (image y points
+    down). Counter-clockwise means two points were swapped (e.g. 20|1 with 6|10 and 3|19 with 11|14):
+    the calibration then fits the rings and wires perfectly, but every position is mirrored on the board
+    and darts appear to stick out backwards. Mirrors shared/src/board.ts calibrationMirrored.
+    """
+    try:
+        p = [(float(q[0]), float(q[1])) for q in list(points_norm)[:4]]
+    except (TypeError, ValueError, IndexError):
+        return False
+    if len(p) < 4:
+        return False
+    area = sum(p[i][0] * p[(i + 1) % 4][1] - p[(i + 1) % 4][0] * p[i][1] for i in range(4))
+    return area < 0
+
+
 def board_to_image_homography(points_norm: list[tuple[float, float]], width: int, height: int) -> np.ndarray | None:
     """Homography mapping board mm -> image pixels from normalised calibration points."""
     if len(points_norm) != len(CALIBRATION_POINTS):

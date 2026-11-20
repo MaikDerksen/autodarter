@@ -102,6 +102,7 @@ class SimWorld:
             for m in self.models
         ]
         self.darts: list[tuple[np.ndarray, np.ndarray]] = []
+        self.air: list[tuple[np.ndarray, np.ndarray]] = []  # darts flying / dropping in front of the board
         self.hand: np.ndarray | None = None
         self.version = 0
         self.lock = threading.Lock()
@@ -120,6 +121,36 @@ class SimWorld:
             self.darts.append((np.array([x, y, 0.0]), d))
             self.version += 1
         return x, y
+
+    def bounce(self, x: float | None = None, y: float | None = None) -> tuple[float, float]:
+        """Animated bounce-out: the dart hits (x, y) and drops down in front of the board (~0.4 s)."""
+        if x is None or y is None:
+            r, a = self.rng.uniform(0, 170), self.rng.uniform(0, 2 * math.pi)
+            x, y = r * math.cos(a), r * math.sin(a)
+        d = np.array([0.15, -0.35, 0.92])
+        d /= np.linalg.norm(d)
+
+        def run():
+            for k in range(4):
+                with self.lock:
+                    self.air = [(np.array([x, y - 50.0 * k, 25.0 + 15.0 * k]), d)]
+                    self.version += 1
+                time.sleep(0.1)
+            with self.lock:
+                self.air = []
+                self.version += 1
+
+        threading.Thread(target=run, daemon=True).start()
+        return x, y
+
+    def fall_out(self, index: int = 0) -> bool:
+        """A dart that stuck falls out of the board (the oldest one by default)."""
+        with self.lock:
+            if not self.darts:
+                return False
+            self.darts.pop(min(max(index, 0), len(self.darts) - 1))
+            self.version += 1
+        return True
 
     def set_hand(self, pos: tuple[float, float] | None) -> None:
         with self.lock:
@@ -154,7 +185,7 @@ class SimWorld:
     def render(self, cam: int, noise: int = 0) -> np.ndarray:
         m = self.models[cam]
         with self.lock:
-            darts = list(self.darts)
+            darts = list(self.darts) + list(self.air)
             hand = None if self.hand is None else self.hand.copy()
         img = self.base[cam].copy()
         parts = []  # (depth, draw-fn)

@@ -136,6 +136,23 @@ export const CALIBRATION_POINTS: CalibrationPointDef[] = [
   { id: 'bull', label: 'Bull', x: 0, y: 0 },
 ];
 
+/**
+ * True if the four outer calibration points lie in mirrored order in the image (two of them swapped,
+ * e.g. 20|1 with 6|10 and 3|19 with 11|14). A camera in front of the board always sees them clockwise
+ * (image y points down). Such a calibration fits the rings and wires perfectly, but every position is
+ * mirrored. Same check as calibration_mirrored in board/autodarter_board/geometry.py.
+ */
+export function calibrationMirrored(points: Point[] | null | undefined): boolean {
+  if (!points || points.length < 4) return false;
+  let area = 0;
+  for (let i = 0; i < 4; i++) {
+    const a = points[i];
+    const b = points[(i + 1) % 4];
+    area += a.x * b.y - b.x * a.y;
+  }
+  return area < 0;
+}
+
 /** All segments a dart can hit (no MISS). */
 export const ALL_SEGMENTS: Segment[] = (() => {
   const list: Segment[] = [];
