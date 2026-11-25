@@ -47,6 +47,13 @@ CALIB_ERROR_PX = (1.0, 1.0, 2.5)  # per camera, at 1280x720
 TILT = 0.3  # max. tangent of the dart tilt per axis
 SHIFT = 4  # sub-pixel bits for drawing
 RING_WIRES = (g.DOUBLE_BULL, g.BULL, g.TRIPLE_INNER, g.TRIPLE_OUTER, g.DOUBLE_INNER, g.DOUBLE_OUTER)
+# point, barrel, shaft and flight colours (BGR) – "dark": black darts, which on the cream sectors
+# only make the image darker (like a shadow) and on the black ones are hardly visible
+DART_COLORS = {
+    "light": ((185, 185, 190), (75, 72, 70), (25, 25, 25), (190, 90, 30)),
+    "dark": ((150, 150, 155), (38, 36, 36), (20, 20, 20), (28, 28, 30)),
+}
+COLORS = DART_COLORS["light"]
 GROUP_AIMS = [(20, 3), (19, 3), (18, 3), (20, 1), (25, 2), (16, 2), (20, 2), (14, 3)]
 
 
@@ -101,7 +108,7 @@ class BenchWorld(SimWorld):
         img = self.base[cam].copy()
         parts = []
         for tip, d in self.darts:
-            for a, b, radius, color in ((0, 22, 1.0, (185, 185, 190)), (22, 65, 3.6, (75, 72, 70)), (65, 100, 1.6, (25, 25, 25))):
+            for a, b, radius, color in ((0, 22, 1.0, COLORS[0]), (22, 65, 3.6, COLORS[1]), (65, 100, 1.6, COLORS[2])):
                 uv, depth = m.project(np.array([tip + d * a, tip + d * b]))
                 th = max(1, int(round(2 * radius * m.focal / float(depth.mean()))))
                 parts.append((float(depth.mean()), "line", uv, th, color))
@@ -113,7 +120,7 @@ class BenchWorld(SimWorld):
             for e in (e1, e2):
                 quad = np.array([tip + d * 95 + e * 2, tip + d * 138 + e * 16, tip + d * 138 - e * 16, tip + d * 95 - e * 2])
                 uv, depth = m.project(quad)
-                parts.append((float(depth.mean()), "poly", uv, 0, (190, 90, 30)))
+                parts.append((float(depth.mean()), "poly", uv, 0, COLORS[3]))
         for _, kind, uv, th, color in sorted(parts, key=lambda p: -p[0]):
             pts = np.round(uv * (1 << SHIFT)).astype(np.int32)
             if kind == "line":
@@ -337,7 +344,9 @@ if __name__ == "__main__":
     ap.add_argument("--calib", type=float, default=1.0, help="scale of the calibration error (0 = perfect calibration)")
     ap.add_argument("--center", action="store_true", help="calibration points like the stock simulator (pixel centre / width)")
     ap.add_argument("--worst", type=int, default=10)
+    ap.add_argument("--darts-color", choices=list(DART_COLORS), default="light", help="dark = black darts")
     args = ap.parse_args()
+    COLORS = DART_COLORS[args.darts_color]
     for sc in SCENARIOS if args.scenario == "all" else [args.scenario]:
         t0 = time.perf_counter()
         calib = tuple(e * args.calib for e in CALIB_ERROR_PX)

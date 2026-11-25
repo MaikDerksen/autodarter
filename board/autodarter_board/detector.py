@@ -40,7 +40,15 @@ FULL_BLUR = 3  # Gaussian kernel for the full resolution dart analysis
 # Official rule: a dart that bounces out or falls out of the board before it is retrieved does not score.
 BOUNCE_MAX_S = 1.5  # a bounce-out is a short motion (dart hits and drops) ...
 BOUNCE_AREA = 2.0  # ... seen by (at least two) cameras with >= BOUNCE_AREA * minDartArea moving pixels ...
-QUIET_AFTER_HAND_S = 3.0  # ... and not right after a hand was at the board (walking away after the takeout)
+BOUNCE_ELONGATION = 2.0  # ... where they saw a dart shaped object (not a shadow) in front of the board ...
+QUIET_AFTER_HAND_S = 5.0  # ... and not right after a hand was at the board (walking back after the takeout)
+LOW_THRESHOLD = 0.5  # hysteresis: weaker changes (x diffThreshold) count when connected to clear ones
+SHADOW_EDGE = 10  # px around a shadow (processing image) where no weak dart pixels are added
+LIGHT_MIN_PX = 30  # a change region needs this many pixels for the shadow / light test
+LIGHT_WINDOW = 7  # local brightness ratio window (processing image pixels)
+LIGHT_EDGE = 60.0  # Sobel magnitude of a board edge (wire, sector border) in the processing image
+LIGHT_EDGE_SHARE = 0.04  # ... at least this share of the region must lie on board edges ...
+LIGHT_EDGE_CORR = 0.9  # ... which keep their direction (gradient correlation current vs. reference)
 GONE_SHARE = 0.75  # a dart fell out when (nearly) all its pixels show the empty board again
 AGREEMENT_WINDOW = 12  # darts seen by >= 3 cameras: does a camera agree with the others?
 
@@ -144,6 +152,75 @@ def _shrink(gray: np.ndarray, width: int) -> np.ndarray:
     return cv2.GaussianBlur(gray, (5, 5), 0)
 
 
+def _light_only(cur: np.ndarray, ref: np.ndarray, sel: np.ndarray, strict: bool = True) -> bool:
+    """True if the changed pixels ``sel`` only got darker (or brighter): the board seen through a
+    shadow (player in front of the light, arm while aiming) or in more light.
+
+    The board's own pattern (wires, sector edges, numbers) stays visible, scaled by a smooth
+    factor. A dart covers it: in front of the board edges disappear and its own edges appear. A
+    region without any board pattern cannot be told apart from a plain dart part (a black barrel
+    on a cream sector, a flight on a black one) - it counts as possibly a dart, unless ``strict``
+    is off (bounce-outs: there a missed dart costs nothing, a shadow taken for a dart a whole turn).
+    """
+    n = int(np.count_nonzero(sel))
+    if n < LIGHT_MIN_PX:
+        return False
+    c = cur.astype(np.float32) + 1.0
+    r = ref.astype(np.float32) + 1.0
+    cs, rs = c[sel], r[sel]
+    darker = float(np.mean(cs < rs))
+    if 0.05 < darker < 0.95:
+        return False
+    # the board pattern inside the region must still be there, with the same edge directions
+    gcx, gcy = cv2.Sobel(c, cv2.CV_32F, 1, 0), cv2.Sobel(c, cv2.CV_32F, 0, 1)
+    grx, gry = cv2.Sobel(r, cv2.CV_32F, 1, 0), cv2.Sobel(r, cv2.CV_32F, 0, 1)
+    edges = sel & (cv2.magnitude(grx, gry) >= LIGHT_EDGE)
+    corr = None
+    if int(np.count_nonzero(edges)) >= max(8, LIGHT_EDGE_SHARE * n):
+        cx, cy, rx, ry = gcx[edges], gcy[edges], grx[edges], gry[edges]
+        corr = float(np.sum(cx * rx + cy * ry)) / math.sqrt(float(np.sum(cx * cx + cy * cy) * np.sum(rx * rx + ry * ry)) + 1e-6)
+        if corr < LIGHT_EDGE_CORR:
+            return False
+    elif strict:
+        return False
+    # and the brightness follows the board, scaled by a smooth (local) factor
+    k = cv2.blur(c, (LIGHT_WINDOW, LIGHT_WINDOW)) / cv2.blur(r, (LIGHT_WINDOW, LIGHT_WINDOW))
+    dev = float(np.median(np.abs(cs - k[sel] * rs)))
+    limit = max(4.0, 0.06 * float(np.median(np.abs(cs - rs))))
+    if not strict and corr is not None and corr >= 0.97:
+        # board pattern clearly kept; thin pieces (a ring under the shadow) get neighbouring colours
+        # into the ratio window
+        limit *= 2
+    return dev <= limit
+
+
+def _without_light(cur: np.ndarray, ref: np.ndarray, mask: np.ndarray, strict: bool = True) -> np.ndarray:
+    """The change mask without the regions that are only shadows / light changes."""
+    if cv2.countNonZero(mask) < LIGHT_MIN_PX:
+        return mask
+    ys, xs = np.nonzero(mask)
+    pad = LIGHT_WINDOW
+    y0, y1 = max(0, int(ys.min()) - pad), min(mask.shape[0], int(ys.max()) + 1 + pad)
+    x0, x1 = max(0, int(xs.min()) - pad), min(mask.shape[1], int(xs.max()) + 1 + pad)
+    m, c, r = mask[y0:y1, x0:x1], cur[y0:y1, x0:x1], ref[y0:y1, x0:x1]
+    if _light_only(c, r, m > 0, strict):  # all of it (a shadow falls apart into many small pieces)
+        return np.zeros_like(mask)
+    out = None
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    for i in range(1, n):
+        x, y, w, h, area = (int(v) for v in stats[i])
+        if area < LIGHT_MIN_PX:
+            continue
+        bx0, by0 = max(0, x - pad), max(0, y - pad)
+        bx1, by1 = min(m.shape[1], x + w + pad), min(m.shape[0], y + h + pad)
+        sel = labels[by0:by1, bx0:bx1] == i
+        if _light_only(c[by0:by1, bx0:bx1], r[by0:by1, bx0:bx1], sel, strict):
+            if out is None:
+                out = mask.copy()
+            out[y0 + by0 : y0 + by1, x0 + bx0 : x0 + bx1][sel] = 0
+    return mask if out is None else out
+
+
 class Detector:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -164,6 +241,7 @@ class Detector:
         self._motion_last = 0.0
         self._motion_peak: dict[int, int] = {}
         self._motion_hand = False
+        self._motion_darts: set[int] = set()  # cameras that saw a dart shaped object during the motion
         self._quiet_until = 0.0
         # per camera: was its line part of the consensus of darts that >= 3 cameras saw
         self.agreement: dict[int, deque] = {}
@@ -199,6 +277,7 @@ class Detector:
             self.turn_darts = []
             self._motion_peak = {}
             self._motion_hand = False
+            self._motion_darts = set()
 
     def set_detecting(self, on: bool) -> None:
         with self._lock:
@@ -290,7 +369,7 @@ class Detector:
         if moving_now:
             now = time.monotonic()
             if not self.moving:
-                self._motion_start, self._motion_peak, self._motion_hand = now, {}, False
+                self._motion_start, self._motion_peak, self._motion_hand, self._motion_darts = now, {}, False, set()
             self._motion_last = now
             for idx, m in frame_diff.items():
                 self._motion_peak[idx] = max(self._motion_peak.get(idx, 0), m)
@@ -298,10 +377,17 @@ class Detector:
             self.calm = 0
             # a hand in front of the board -> takeout started (no need to wait for calm)
             if self.state != "takeout_in_progress":
-                areas = {i: self._change_area(i, g, self.cams[i].ref) for i, g in grays.items()}
+                masks = {i: self._diff_mask(i, g, self.cams[i].ref) for i, g in grays.items() if self.cams[i].ref is not None}
+                areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
+                if self._is_hand(areas):
+                    # the player's shadow on the board is no hand
+                    masks = {i: _without_light(grays[i], self.cams[i].ref, m) for i, m in masks.items()}
+                    areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
                 if self._is_hand(areas):
                     self._motion_hand = True
                     self._enter_takeout(events)
+                elif self._watch_bounce() and len(self._motion_darts) < 2:
+                    self._motion_darts |= self._dart_views(grays, {i: m for i, m in masks.items() if i not in self._motion_darts})
             else:
                 self._motion_hand = True
             return events
@@ -355,11 +441,6 @@ class Detector:
         mask = cv2.dilate(cv2.erode(mask, k, anchor=(0, 0)), k, anchor=(1, 1))
         return mask
 
-    def _change_area(self, idx: int, g: np.ndarray, ref: np.ndarray | None) -> int:
-        if ref is None:
-            return 0
-        return cv2.countNonZero(self._diff_mask(idx, g, ref))
-
     def _is_hand(self, areas: dict[int, int]) -> bool:
         big = [a for a in areas.values() if a > self.settings.takeoutArea]
         return len(big) >= 2 or any(a > 2 * self.settings.takeoutArea for a in areas.values()) or (
@@ -384,7 +465,11 @@ class Detector:
 
     def _evaluate(self, grays: dict[int, np.ndarray], fulls: dict[int, np.ndarray], events: list[tuple]) -> None:
         s = self.settings
-        masks = {i: self._diff_mask(i, g, self.cams[i].ref) for i, g in grays.items()}
+        # shadows of the player (and light changes) are neither a hand nor a dart
+        raw = {i: self._diff_mask(i, g, self.cams[i].ref) for i, g in grays.items()}
+        masks = {i: _without_light(grays[i], self.cams[i].ref, m) for i, m in raw.items()}
+        # where the shadows are (their soft edges must not be added to a dart, see _grow)
+        shadows = {i: cv2.bitwise_and(m, cv2.bitwise_not(masks[i])) for i, m in raw.items()}
         areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
         self.last_areas = areas
 
@@ -438,9 +523,12 @@ class Detector:
         # At least one camera saw a dart. Far from a camera a dart is small in its image (often just
         # below minDartArea), but every additional view makes the intersection much more stable.
         for idx, mask in masks.items():
-            if areas[idx] < max(8, s.minDartArea // 3) or self.cams[idx].mirrored:
+            if self.cams[idx].mirrored:
                 continue
-            obs = self._analyze(idx, mask, fulls.get(idx))
+            mask = self._grow(idx, grays[idx], mask, shadows.get(idx))
+            if cv2.countNonZero(mask) < max(8, s.minDartArea // 3):
+                continue
+            obs = self._analyze(idx, mask, fulls.get(idx), grays.get(idx))
             if obs is not None:
                 observations.append(obs)
         result = fuse(observations)
@@ -480,6 +568,34 @@ class Detector:
             )
         )
         events.append(("state",))
+
+    def _grow(self, idx: int, g: np.ndarray, strong: np.ndarray, shadow: np.ndarray | None = None) -> np.ndarray:
+        """Hysteresis: weaker changes connected to the clear ones belong to the dart as well.
+
+        A black dart in front of a black sector or a red ring differs only by a few grey levels -
+        it falls apart into small pieces or vanishes in all but one camera. The pieces that pass the
+        normal threshold show where it is, the weaker pixels around them complete it.
+        """
+        cam = self.cams[idx]
+        n_strong = cv2.countNonZero(strong)
+        if n_strong == 0 or cam.ref is None:
+            return strong
+        lo = self.settings.diffThreshold * LOW_THRESHOLD
+        weak = cv2.absdiff(g, cam.ref) > lo
+        if cam.empty is not None and cam.empty is not cam.ref and cam.empty.shape == g.shape:
+            weak &= cv2.absdiff(g, cam.empty) > lo
+        weak = cv2.bitwise_and(weak.astype(np.uint8) * 255, cam.roi)
+        if shadow is not None and cv2.countNonZero(shadow):
+            # not into a shadow or its soft edge
+            near = cv2.dilate(shadow, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * SHADOW_EDGE + 1, 2 * SHADOW_EDGE + 1)))
+            weak = cv2.bitwise_and(weak, cv2.bitwise_not(near))
+        weak = cv2.bitwise_or(weak, strong)
+        n, labels = cv2.connectedComponents(weak, connectivity=8)
+        keep = np.unique(labels[strong > 0])
+        grown = np.isin(labels, keep[keep > 0])
+        if int(np.count_nonzero(grown)) > max(4 * n_strong, n_strong + 1500):
+            return strong  # a slow light change around the dart, not the dart
+        return grown.astype(np.uint8) * 255
 
     # ------------------------------------------------------------------ bounce-outs and fall-outs
     def _only_new(self, idx: int, mask: np.ndarray, g: np.ndarray) -> np.ndarray:
@@ -525,8 +641,56 @@ class Detector:
                 gone.append(d)
         return gone
 
+    def _watch_bounce(self) -> bool:
+        return bool(getattr(self.settings, "bounceOut", 1)) and self.state == "throw" and self.darts < 3 and not self._motion_hand
+
+    def _dart_views(self, grays: dict[int, np.ndarray], masks: dict[int, np.ndarray]) -> set[int]:
+        """Cameras that see a dart shaped object (long and thin, not a shadow) in front of the board."""
+        s = self.settings
+        lo = BOUNCE_AREA * s.minDartArea
+        seen: set[int] = set()
+        for idx, mask in masks.items():
+            cam = self.cams[idx]
+            if cam.mirrored or cam.ref is None:
+                continue
+            area = cv2.countNonZero(mask)
+            if area < lo or area >= s.takeoutArea:
+                continue
+            # a shadow that leaves shows the empty board again: no new object in front of it
+            mask = self._only_new(idx, mask, grays[idx])
+            whole: list[bool] = []  # is everything that changed in this camera only darker / brighter?
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+            # the biggest pieces: long and thin (cheap) and not just darker / brighter (shadow)
+            for i in (1 + np.argsort(-stats[1:, cv2.CC_STAT_AREA]))[:3]:
+                x, y, w, h, area = (int(v) for v in stats[i])
+                if area < s.minDartArea:
+                    break
+                ys, xs = np.nonzero(labels[y : y + h, x : x + w] == i)
+                ev = np.linalg.eigvalsh(np.cov(np.vstack([xs, ys]).astype(np.float64)))
+                if math.sqrt(ev[1] / max(ev[0], 1e-6)) < BOUNCE_ELONGATION:
+                    continue
+                pad = LIGHT_WINDOW
+                x0, y0 = max(0, x - pad), max(0, y - pad)
+                x1, y1 = min(mask.shape[1], x + w + pad), min(mask.shape[0], y + h + pad)
+                sel = labels[y0:y1, x0:x1] == i
+                if _light_only(grays[idx][y0:y1, x0:x1], cam.ref[y0:y1, x0:x1], sel, strict=False):
+                    continue
+                if not whole:
+                    # a shadow falls apart into slivers (sector by sector); one sliver alone can look
+                    # like something new, all of them together are clearly the darker board
+                    whole.append(cv2.countNonZero(_without_light(grays[idx], cam.ref, mask, strict=False)) == 0)
+                if whole[0]:
+                    break
+                seen.add(idx)
+                break
+        return seen
+
     def _bounced_out(self) -> bool:
-        """A short, dart-sized motion in front of the board that left nothing behind."""
+        """A short motion in front of the board in which a dart was seen, and that left nothing behind.
+
+        Shadows (the player walking back or aiming) also cause short motions that leave nothing
+        behind - without the dart shaped object in at least two cameras they are no bounce-out.
+        """
         s = self.settings
         if not getattr(s, "bounceOut", 1) or self.state != "throw" or self.darts >= 3:
             return False
@@ -536,10 +700,11 @@ class Detector:
         seen = [p for p in self._motion_peak.values() if p >= lo]
         if any(p >= s.takeoutArea for p in self._motion_peak.values()):
             return False
-        return len(seen) >= min(2, len(self.cams))
+        need = min(2, sum(1 for c in self.cams.values() if not c.mirrored))
+        return need > 0 and len(seen) >= need and len(self._motion_darts) >= need
 
     def _add_bounce_out(self, events: list[tuple]) -> None:
-        log.info("bounce-out: dart hit the board and dropped (peaks %s)", self._motion_peak)
+        log.info("bounce-out: dart hit the board and dropped (peaks %s, dart seen by cameras %s)", self._motion_peak, sorted(self._motion_darts))
         self.darts += 1
         if self.darts >= 3:
             self.state = "takeout"
@@ -549,9 +714,9 @@ class Detector:
         )
         events.append(("state",))
 
-    def _analyze(self, idx: int, mask: np.ndarray, full: np.ndarray | None = None) -> Observation | None:
+    def _analyze(self, idx: int, mask: np.ndarray, full: np.ndarray | None = None, gray: np.ndarray | None = None) -> Observation | None:
         cam = self.cams[idx]
-        blob = self._dart_blob(cam, mask)
+        blob = self._dart_blob(cam, mask, gray)
         if blob is None:
             return None
         self._blobs[idx] = blob
@@ -581,7 +746,7 @@ class Detector:
             return None
         return self._fit(cam, pts, 1.0, False, length, area)
 
-    def _dart_blob(self, cam: CameraState, mask: np.ndarray) -> np.ndarray | None:
+    def _dart_blob(self, cam: CameraState, mask: np.ndarray, gray: np.ndarray | None = None) -> np.ndarray | None:
         """The new dart in the change mask (bool image), or None."""
         # The dart often falls apart into pieces (dark shaft on a dark board gives no difference):
         # start with the biggest blob and grow it by nearby fragments.
@@ -621,8 +786,30 @@ class Detector:
         clusters: dict[int, list[int]] = {}
         for i in comps:
             clusters.setdefault(find(i), []).append(i)
-        members = max(clusters.values(), key=lambda m: sum(int(stats[i, cv2.CC_STAT_AREA]) for i in m))
-        return np.isin(labels, members)
+
+        def size(m: list[int]) -> int:
+            return sum(int(stats[i, cv2.CC_STAT_AREA]) for i in m)
+
+        def plain(m: list[int]) -> bool:
+            """Only darker / brighter than before (a shadow that moved with the throw)?"""
+            if gray is None or cam.ref is None or size(m) < LIGHT_MIN_PX:
+                return False
+            x0 = min(int(stats[i, 0]) for i in m)
+            y0 = min(int(stats[i, 1]) for i in m)
+            x1 = max(int(stats[i, 0] + stats[i, 2]) for i in m)
+            y1 = max(int(stats[i, 1] + stats[i, 3]) for i in m)
+            pad = LIGHT_WINDOW
+            x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
+            x1, y1 = min(mask.shape[1], x1 + pad), min(mask.shape[0], y1 + pad)
+            sel = np.isin(labels[y0:y1, x0:x1], m)
+            return _light_only(gray[y0:y1, x0:x1], cam.ref[y0:y1, x0:x1], sel, strict=False)
+
+        groups = sorted(clusters.values(), key=size, reverse=True)
+        if len(groups) > 1:
+            # the biggest region that is not just a shadow; if every region is plain, the biggest one
+            # (a black dart on a cream sector also only makes the image darker)
+            groups = [m for m in groups[:4] if not plain(m)] + groups
+        return np.isin(labels, groups[0])
 
     def _full_points(
         self, cam: CameraState, blob: np.ndarray, xs: np.ndarray, ys: np.ndarray, full: np.ndarray
@@ -645,10 +832,16 @@ class Detector:
         cur = cv2.GaussianBlur(full[y0:y1, x0:x1], k, 0)
         ref = cv2.GaussianBlur(cam.ref_full[y0:y1, x0:x1], k, 0)
         thr = self.settings.diffThreshold
-        changed = (cv2.absdiff(cur, ref) > thr) & (near > 0)
+        lo = thr * LOW_THRESHOLD
+        diff = cv2.absdiff(cur, ref)
+        changed = (diff > lo) & (near > 0)
         if cam.empty_full is not None and cam.empty_full is not cam.ref_full and cam.empty_full.shape == full.shape:
             # a dart that fell out at the same time leaves the empty board behind, not a new dart
-            changed &= cv2.absdiff(cur, cv2.GaussianBlur(cam.empty_full[y0:y1, x0:x1], k, 0)) > thr
+            changed &= cv2.absdiff(cur, cv2.GaussianBlur(cam.empty_full[y0:y1, x0:x1], k, 0)) > lo
+        # hysteresis: weak pixels only where they are connected to clear ones
+        n, labels = cv2.connectedComponents(changed.astype(np.uint8), connectivity=8)
+        keep = np.unique(labels[changed & (diff > thr)])
+        changed = np.isin(labels, keep[keep > 0])
         fy, fx = np.nonzero(changed)
         if len(fx) < max(8, self.settings.minDartArea // 3) * sx * sy:
             return None, None

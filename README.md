@@ -54,7 +54,7 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Bewegt sich eine Hand am Board, ohne Darts zu ziehen, bleibt der Zustand erhalten.
   - **Abpraller und rausgefallene Darts** (offizielle Regel: zählt als geworfen, aber ohne Punkte):
     - Fällt ein Dart vor dem Ziehen aus dem Board – auch während der nächste einschlägt –, wird er nachträglich zu **Miss** („rausgefallen“), seine Markierung bleibt grau stehen.
-    - Trifft ein Dart das Board und fällt sofort herunter, meldet das Board einen **Miss** („Abpraller“). Das lässt sich unter *Erkennungs-Einstellungen → Abpraller als Miss* abschalten, falls Bewegungen direkt vor dem Board fälschlich als Abpraller gezählt werden. Ein Dart, der das Board ganz verfehlt, ist für die Kameras oft unsichtbar – den bitte als Miss eintippen.
+    - Trifft ein Dart das Board und fällt sofort herunter, meldet das Board einen **Miss** („Abpraller“). Schatten zählen dafür seit 0.4.2 nicht mehr. Das lässt sich unter *Erkennungs-Einstellungen → Abpraller als Miss* abschalten, falls Bewegungen direkt vor dem Board fälschlich als Abpraller gezählt werden. Ein Dart, der das Board ganz verfehlt, ist für die Kameras oft unsichtbar – den bitte als Miss eintippen.
 - **Spielmodi**:
   - **X01** (301/501): Straight-, Double- oder Master-In und -Out, Bust-Regel, Legs („First to N“), Checkout-Vorschläge
   - **Cricket**: Standard oder Cut-Throat, Rundenlimit
@@ -279,13 +279,14 @@ Unter **Spielen** 301 / 501 / Cricket / Around the Clock wählen, Spieler hinzuf
 ## So funktioniert die Erkennung
 
 1. Jede Kamera vergleicht das aktuelle Bild mit einem Referenzbild (das Board vor dem Wurf). Ist das Bild wieder ruhig, wird die Änderung ausgewertet.
-2. Die Fragmente des neuen Darts (Spitze, Barrel, Flight) werden gesammelt. Dabei hilft die Richtung der Board-Normalen im Bild, die aus der Kalibrierung berechnet wird (Kamerapose per Homographie-Zerlegung).
-3. Die **Dart-Achse** wird auf dem schmalen Teil (Spitze und Barrel) gefittet, der breite Flight wird ausgeschlossen.
-4. Über die Kalibrier-Homographie wird diese Achse auf die Board-Ebene abgebildet. Die Spitze liegt **garantiert auf dieser Linie**, auch wenn die dünne Stahlspitze im Bild nicht zu sehen ist.
-5. Die Linien aller Kameras werden robust geschnitten: das beste konsistente Kamerapaar, danach Ausgleichsrechnung über alle passenden Kameras. Daraus ergeben sich Position (mm) und Segment.
-6. Takeout: Eine große Änderung bedeutet „Hand am Board“. Wird das Bild danach wieder ruhig und hat sich etwas verändert, ist der Takeout beendet. Hat sich nichts verändert, bleibt der alte Zustand erhalten.
-7. Rausgefallen: Zeigen die Pixel eines Darts dieser Aufnahme wieder das leere Board, ist er herausgefallen. Diese Stelle zählt auch nicht als neuer Dart.
-8. Abpraller: Eine kurze, dart-große Bewegung, die mindestens zwei Kameras sehen und die nichts im Board hinterlässt (nicht direkt nach dem Ziehen).
+2. **Schatten** (Spieler vor dem Licht, Arm beim Zielen, Zurücklaufen nach dem Ziehen) fallen heraus: Wo das Board nur dunkler oder heller geworden ist und sein eigenes Muster (Drähte, Feldkanten) noch sichtbar bleibt, ist kein Dart.
+3. Die Fragmente des neuen Darts (Spitze, Barrel, Flight) werden gesammelt. Schwächere Änderungen, die an klare Dart-Pixel anschließen, gehören mit dazu – so bleibt ein schwarzer Dart vor einem schwarzen Feld oder einem roten Ring in mehreren Kameras sichtbar. Dabei hilft die Richtung der Board-Normalen im Bild, die aus der Kalibrierung berechnet wird (Kamerapose per Homographie-Zerlegung).
+4. Die **Dart-Achse** wird auf dem schmalen Teil (Spitze und Barrel) gefittet, der breite Flight wird ausgeschlossen.
+5. Über die Kalibrier-Homographie wird diese Achse auf die Board-Ebene abgebildet. Die Spitze liegt **garantiert auf dieser Linie**, auch wenn die dünne Stahlspitze im Bild nicht zu sehen ist.
+6. Die Linien aller Kameras werden robust geschnitten: das beste konsistente Kamerapaar, danach Ausgleichsrechnung über alle passenden Kameras. Daraus ergeben sich Position (mm) und Segment.
+7. Takeout: Eine große Änderung bedeutet „Hand am Board“. Wird das Bild danach wieder ruhig und hat sich etwas verändert, ist der Takeout beendet. Hat sich nichts verändert, bleibt der alte Zustand erhalten.
+8. Rausgefallen: Zeigen die Pixel eines Darts dieser Aufnahme wieder das leere Board, ist er herausgefallen. Diese Stelle zählt auch nicht als neuer Dart.
+9. Abpraller: Eine kurze Bewegung, in der mindestens zwei Kameras einen dart-förmigen Gegenstand (lang und dünn, kein Schatten) vor dem Board sehen und die nichts im Board hinterlässt (nicht in den ersten 5 Sekunden nach dem Ziehen).
 
 Ergebnis im Simulator mit 240 Würfen auf 3 Kameras (die Hälfte mit absichtlich 2 px Kalibrierfehler):
 
