@@ -18,6 +18,7 @@ export default function ProfileScreen() {
   const [updater, setUpdater] = useState<{ updaterActive: boolean } | null>(null);
   const [updateMsg, setUpdateMsg] = useState<string | null>(null);
   const [updateErr, setUpdateErr] = useState<string | null>(null);
+  const [openReports, setOpenReports] = useState<number | null>(null);
 
   useEffect(() => {
     api<{ version?: string }>('/api/health')
@@ -29,6 +30,9 @@ export default function ProfileScreen() {
     if (!user?.isAdmin) return;
     api<{ updaterActive: boolean }>('/api/admin/update')
       .then(setUpdater)
+      .catch(() => undefined);
+    api<{ reports: unknown[] }>('/api/reports?status=open')
+      .then((r) => setOpenReports(r.reports.length))
       .catch(() => undefined);
   }, [user?.isAdmin]);
 
@@ -97,6 +101,18 @@ export default function ProfileScreen() {
           ) : null}
           {updateMsg ? <Text style={{ color: colors.accent }}>{updateMsg}</Text> : null}
           <ErrorText>{updateErr}</ErrorText>
+        </Card>
+      ) : null}
+      {user?.isAdmin ? (
+        <Card>
+          <H2>Fehlerberichte</H2>
+          <P muted>
+            Im Spiel gemeldete Fehlerkennungen mit den Kamerabildern des Boards
+            {openReports !== null ? ` – ${openReports === 0 ? 'keine offenen' : `${openReports} offen`}` : ''}.
+          </P>
+          <Row wrap>
+            <Button title="Fehlerberichte ansehen" icon="bug" variant="secondary" onPress={() => router.push('/reports')} />
+          </Row>
         </Card>
       ) : null}
       <Button title="Abmelden" variant="danger" icon="log-out" onPress={() => void logout()} />

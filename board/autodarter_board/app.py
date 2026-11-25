@@ -38,6 +38,10 @@ OUTBOX_MAX_AGE = 180
 BUSY_SECONDS = 15 * 60
 # Edge length (px) of the frontal camera view.
 FRONT_SIZE = 520
+# Bug reports: the detector images are sent lossless (PNG), the live colour images as JPEG.
+REPORT_PNG = [int(cv2.IMWRITE_PNG_COMPRESSION), 3]
+REPORT_JPEG = [int(cv2.IMWRITE_JPEG_QUALITY), 92]
+REPORT_MAX_DARTS = 9
 
 
 def encode_jpeg(frame, max_width: int | None = None, quality: int = 75) -> tuple[str, int, int]:
@@ -82,6 +86,7 @@ class BoardApp:
         self._cam_lock = threading.Lock()
         self.outbox: deque[tuple[float, dict]] = deque(maxlen=200)
         self.notice: str | None = None
+        self._report_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ cameras & calibration
     def start_cameras(self) -> None:
@@ -231,6 +236,94 @@ class BoardApp:
             "version": BUILD_VERSION or __version__,
             "capabilities": {"restart": True, "reboot": self.can_reboot(), "update": self.can_update(), "autoCalibrate": True},
         }
+
+    def collect_report(self, dart_ids: list[str], discarded: int) -> tuple[list[tuple[str, str, bytes]], dict]:
+        """Camera images and detector data for a bug report (worker thread).
+
+        Per reported dart (and per discarded change, where a missed dart ends up) and camera: the
+        image the detector compared against (before), the one with the most motion (peak) and the calm
+        one it evaluated (after) - lossless, so the detection can be replayed exactly. Plus the current
+        reference / empty board images and a live colour image of every camera.
+        """
+        det = self.detector
+        with det._lock:
+            darts = [e for e in det.evidence if e["id"] in dart_ids]
+            others = list(det.discarded)[-discarded:] if discarded > 0 else []
+            current = {i: (c.ref_full, c.empty_full) for i, c in det.cams.items()}
+            detector = {
+                "state": det.public_state(),
+                "darts": det.darts,
+                "lastAreas": dict(det.last_areas),
+                "lastLighting": det.last_lighting or None,
+                "dark": det.dark,
+            }
+        files: list[tuple[str, str, bytes]] = []
+        names: dict[int, str] = {}  # the same image (after of one dart = before of the next) is sent once
+
+        def add(arr, name: str) -> str | None:
+            if arr is None:
+                return None
+            if id(arr) not in names:
+                ok, buf = cv2.imencode(".png", arr, REPORT_PNG)
+                if not ok:
+                    return None
+                names[id(arr)] = f"{name}.png"
+                files.append((names[id(arr)], "image/png", buf.tobytes()))
+            return names[id(arr)]
+
+        entries = []
+        for n, e in enumerate(sorted(darts + others, key=lambda e: e["at"]), 1):
+            frames: dict[str, dict] = {}
+            for part in ("before", "peak", "after"):
+                for idx, arr in sorted(e[part].items()):
+                    name = add(arr, f"{n}-{e['kind']}-cam{idx + 1}-{part}")
+                    if name:
+                        frames.setdefault(str(idx), {})[part] = name
+            entries.append(
+                {"n": n, "id": e["id"], "kind": e["kind"], "at": e["at"], "state": e["state"], "darts": e["darts"], "info": e["info"], "frames": frames}
+            )
+        now: dict[str, dict] = {}
+        for idx, (ref, empty) in sorted(current.items()):
+            now[str(idx)] = {"reference": add(ref, f"now-cam{idx + 1}-reference"), "empty": add(empty, f"now-cam{idx + 1}-empty")}
+        for cam in self.cameras.streams:
+            _, frame = cam.latest()
+            if frame is None:
+                continue
+            ok, buf = cv2.imencode(".jpg", frame, REPORT_JPEG)
+            if ok:
+                name = f"now-cam{cam.index + 1}-live.jpg"
+                files.append((name, "image/jpeg", buf.tobytes()))
+                now.setdefault(str(cam.index), {})["live"] = name
+        found = {e["id"] for e in darts}
+        info = {
+            "at": time.time(),
+            "version": BUILD_VERSION or __version__,
+            "entries": entries,
+            "missing": [i for i in dart_ids if i not in found],
+            "now": now,
+            "detector": detector,
+            "status": self.status(),
+            "settings": self.store.settings.to_dict(),
+            "calibration": self.calibration_by_index(),
+        }
+        return files, info
+
+    async def send_report(self, msg: dict) -> None:
+        """Answer a bug report request: one message per image (they are big), then the data."""
+        rid = msg.get("requestId")
+        try:
+            ids = [i for i in msg.get("darts", []) if isinstance(i, str)][:REPORT_MAX_DARTS]
+            discarded = max(0, min(int(msg.get("discarded", 0)), 6))
+            files, info = await asyncio.to_thread(self.collect_report, ids, discarded)
+            for name, mime, data in files:
+                payload = base64.b64encode(data).decode("ascii")
+                if not await self.send({"type": "report_file", "requestId": rid, "name": name, "mime": mime, "data": payload}):
+                    return
+            await self.send({"type": "report_done", "requestId": rid, "info": info})
+            log.info("bug report sent: %d images, darts %s", len(files), ids)
+        except Exception as err:
+            log.exception("bug report failed")
+            await self.send({"type": "report_done", "requestId": rid, "info": None, "error": str(err)})
 
     def auto_calibrate(self, index: int, prior, hint20) -> dict:
         """Find the board in the current image of a camera. Only a proposal: the app shows it and saves it."""
@@ -454,6 +547,9 @@ class BoardApp:
                 if frame is not None:
                     data, w, h = await asyncio.to_thread(encode_jpeg, frame, None, 90)
             await self.send({"type": "snapshot", "requestId": msg.get("requestId"), "camera": int(msg.get("camera", 0)), "data": data, "width": w, "height": h})
+        elif t == "report_request":
+            # in the background: pings and darts must not wait for the images
+            self._report_task = asyncio.create_task(self.send_report(msg))
         elif t == "auto_calibrate":
             index = int(msg.get("camera", 0))
             result = await asyncio.to_thread(self.auto_calibrate, index, msg.get("prior"), msg.get("hint20"))

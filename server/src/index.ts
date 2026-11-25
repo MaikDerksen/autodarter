@@ -16,6 +16,8 @@ import { friendRoutes } from './friends';
 import { HttpError } from './http';
 import { cleanupStaleMatches, matchRoutes, restoreActiveMatches, serverBusy } from './matches';
 import { statsRoutes } from './stats';
+import { leaderboardRoutes } from './leaderboard';
+import { reportLinkRoutes, reportRoutes } from './reports';
 import { voicePublicRoutes, voiceRoutes } from './voice';
 
 const app = Fastify({ logger: { level: config.logLevel }, bodyLimit: 2 * 1024 * 1024, trustProxy: true });
@@ -63,8 +65,11 @@ await app.register(authRoutes);
 await app.register(boardRoutes);
 await app.register(matchRoutes);
 await app.register(statsRoutes);
+await app.register(leaderboardRoutes);
 await app.register(friendRoutes);
 await app.register(adminRoutes);
+await app.register(reportRoutes);
+await app.register(reportLinkRoutes);
 await app.register(voiceRoutes);
 await app.register(voicePublicRoutes);
 

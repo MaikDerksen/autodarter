@@ -64,8 +64,11 @@ export function Button({
   loading,
   small,
   style,
+  label,
 }: {
   title?: string;
+  /** screen reader text for icon-only buttons */
+  label?: string;
   onPress?: () => void;
   variant?: ButtonVariant;
   icon?: IconName;
@@ -80,6 +83,7 @@ export function Button({
   return (
     <Pressable
       accessibilityRole="button"
+      accessibilityLabel={label ?? title}
       onPress={onPress}
       disabled={disabled || loading}
       style={({ pressed, hovered }: { pressed: boolean; hovered?: boolean }) => [

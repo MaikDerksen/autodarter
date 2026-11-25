@@ -32,6 +32,8 @@ function RootStack() {
           <Stack.Screen name="calibrate/[id]" options={{ title: 'Kalibrierung' }} />
           <Stack.Screen name="voice/index" options={{ title: 'Stimmen' }} />
           <Stack.Screen name="voice/[id]" options={{ title: 'Stimmen-Paket' }} />
+          <Stack.Screen name="reports/index" options={{ title: 'Fehlerberichte' }} />
+          <Stack.Screen name="reports/[id]" options={{ title: 'Fehlerbericht' }} />
         </Stack.Protected>
         <Stack.Protected guard={!user}>
           <Stack.Screen name="login" options={{ headerShown: false, title: 'Anmelden' }} />

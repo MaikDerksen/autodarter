@@ -21,6 +21,7 @@ import {
 import { BoardTools } from '@/components/BoardTools';
 import { Dartboard, type BoardHit } from '@/components/Dartboard';
 import { Keypad } from '@/components/Keypad';
+import { ReportBug } from '@/components/ReportBug';
 import { AtcScoreboard, CricketScoreboard, X01Scoreboard } from '@/components/Scoreboards';
 import { Badge, Button, Card, ErrorText, H2, Loading, Row, Screen, Segmented, Stat } from '@/components/ui';
 import { api, errorMessage } from '@/lib/api';
@@ -129,6 +130,7 @@ export default function MatchScreen() {
   const [callerOn, setCallerOn] = useState(false);
   const [toolsOpen, setToolsOpen] = useState(false);
   const [remoteOpen, setRemoteOpen] = useState(false);
+  const [reportOpen, setReportOpen] = useState(false);
   const [myBoards, setMyBoards] = useState<BoardSummary[] | null>(null);
   /** finished turn that is still shown for a moment after the switch to the next player */
   const [hold, setHold] = useState<TurnView | null>(null);
@@ -281,6 +283,10 @@ export default function MatchScreen() {
   const inputLocked = !canControl || state.finished || (state.awaitingNext && selected === null);
   // technical tools (reset, calibration, restart) for board members while the match runs
   const tools = !!viewBoardId && !!board && board.role !== 'guest' && status === 'running' && !state.finished;
+  // bug report with the camera images of a dart: only where a board detects the darts
+  const reportable = !!match.boardId || state.players.some((p) => !!p.boardId);
+  // phones: no room next to undo / next -> in the header
+  const reportInHeader = width < 480;
   const problem = tools && board ? boardProblem(board) : null;
 
   const toggleInput = (v: 'board' | 'keypad') => {
@@ -495,6 +501,9 @@ export default function MatchScreen() {
           disabled={busy || !canControl || state.finished}
           style={{ flexGrow: 1 }}
         />
+        {reportable && !reportInHeader ? (
+          <Button icon="bug-outline" variant="secondary" label="Fehler melden" onPress={() => setReportOpen(true)} />
+        ) : null}
       </Row>
     </Card>
   );
@@ -619,6 +628,9 @@ export default function MatchScreen() {
           title: describeSettings(state.settings),
           headerRight: () => (
             <Row style={{ marginRight: 8 }} gap={4}>
+              {reportable && reportInHeader ? (
+                <Button small variant="ghost" icon="bug-outline" label="Fehler melden" onPress={() => setReportOpen(true)} />
+              ) : null}
               {tools ? <Button small variant="ghost" icon="construct-outline" onPress={() => setToolsOpen(true)} /> : null}
               {callerAvailable() ? (
                 <Button small variant="ghost" icon={callerOn ? 'volume-high' : 'volume-mute'} onPress={toggleCaller} />
@@ -667,6 +679,9 @@ export default function MatchScreen() {
         </View>
       </Screen>
       {tools && board ? <BoardTools board={board} visible={toolsOpen} onClose={() => setToolsOpen(false)} /> : null}
+      {reportable && reportOpen ? (
+        <ReportBug onClose={() => setReportOpen(false)} matchId={match.id} state={state} canControl={canControl} onState={applyState} />
+      ) : null}
     </>
   );
 }

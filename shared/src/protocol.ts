@@ -119,6 +119,9 @@ export type BoardToServer =
   | { type: 'auto_calibration'; requestId: string; camera: number; result: AutoCalibration }
   | { type: 'calibration'; calibration: Record<string, CameraCalibration | null> }
   | { type: 'settings'; settings: BoardSettings }
+  /** bug report: one image (base64) per message, then report_done with the detector data */
+  | { type: 'report_file'; requestId: string; name: string; mime: string; data: string }
+  | { type: 'report_done'; requestId: string; info: Record<string, unknown> | null; error?: string }
   | { type: 'pong' };
 
 /** Result of the automatic calibration of one camera (proposal - saved only when the user confirms). */
@@ -152,6 +155,8 @@ export type ServerToBoard =
   | { type: 'set_calibration'; camera: number; calibration: CameraCalibration | null }
   | { type: 'command'; action: BoardCommand }
   | { type: 'set_settings'; settings: Partial<BoardSettings> }
+  /** bug report: camera images of these detections (board dart ids) and of the last `discarded` changes that were no dart */
+  | { type: 'report_request'; requestId: string; darts: string[]; discarded: number }
   | { type: 'ping' }
   | { type: 'error'; message: string };
 
@@ -250,6 +255,44 @@ export interface FriendsOverview {
   incoming: FriendUser[];
   /** My open friend requests. */
   outgoing: FriendUser[];
+}
+
+// ---------------------------------------------------------------- bug reports
+
+/** wrong: wrong segment, phantom: a dart nobody threw, missed: a thrown dart was not detected, other: anything else */
+export type BugReportKind = 'wrong' | 'phantom' | 'missed' | 'other';
+export type BugReportStatus = 'open' | 'done';
+
+export interface BugReportSummary {
+  id: string;
+  createdAt: string;
+  kind: BugReportKind;
+  status: BugReportStatus;
+  /** what the board detected (null: nothing / entered by hand) */
+  detected: Segment | null;
+  /** what it really was (null: no dart at all) */
+  actual: Segment | null;
+  note: string;
+  reporter: string | null;
+  boardName: string | null;
+  matchId: string | null;
+  images: number;
+  /** the board did not deliver (all) images */
+  boardError: string | null;
+}
+
+export interface BugReportFile {
+  name: string;
+  mime: string;
+  size: number;
+}
+
+export interface BugReportDetail extends BugReportSummary {
+  /** match, turn, board and detector data */
+  details: Record<string, unknown>;
+  files: BugReportFile[];
+  /** short-lived token for the image and download links (?t=…) */
+  fileToken: string;
 }
 
 export type ServerToClient =

@@ -195,6 +195,13 @@ async function loadViewable(id: string, user: string): Promise<LiveMatch> {
   return m;
 }
 
+/** A match for a bug report (players and everybody who may watch it may report). */
+export async function matchForReport(id: string, user: string) {
+  const m = await loadViewable(id, user);
+  const { row, state } = m;
+  return { row: { id: row.id, settings: row.settings, players: row.players, status: row.status, events: row.events }, state, boardOf: (player: number) => playerBoard(row, player) };
+}
+
 async function loadControllable(id: string, user: string): Promise<LiveMatch> {
   const m = await loadViewable(id, user);
   if (!canControl(m, user)) throw new HttpError(403, 'Du schaust nur zu – eingeben können nur die Mitspieler');
@@ -345,7 +352,7 @@ export async function restoreActiveMatches(): Promise<void> {
 
 // ------------------------------------------------------------------ routes
 
-const segmentSchema = z.union([
+export const segmentSchema = z.union([
   z.string().transform((s, ctx) => {
     try {
       return parseSegment(s);
@@ -665,8 +672,14 @@ export async function matchRoutes(app: FastifyInstance): Promise<void> {
       const ev = events[index];
       if (!ev || ev.t !== 'dart') throw new HttpError(404, 'Wurf nicht gefunden');
       const copy = events.slice();
-      // the detected position was wrong -> drop it, the client draws the segment centre instead
-      copy[index] = { t: 'dart', seg: body.segment, src: 'manual', at: ev.at };
+      // the detected position was wrong -> drop it, the client draws the segment centre instead. What the
+      // board had detected stays (det, bid): a bug report can still find the camera images.
+      const det =
+        ev.det ??
+        (ev.src === 'board'
+          ? { seg: ev.seg, ...(ev.x !== undefined && ev.y !== undefined ? { x: ev.x, y: ev.y } : {}), ...(ev.out ? { out: ev.out } : {}) }
+          : undefined);
+      copy[index] = { t: 'dart', seg: body.segment, src: 'manual', at: ev.at, ...(ev.bid ? { bid: ev.bid } : {}), ...(det ? { det } : {}) };
       return copy;
     });
     return { state };

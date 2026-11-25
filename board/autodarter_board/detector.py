@@ -51,6 +51,25 @@ LIGHT_EDGE_SHARE = 0.04  # ... at least this share of the region must lie on boa
 LIGHT_EDGE_CORR = 0.9  # ... which keep their direction (gradient correlation current vs. reference)
 GONE_SHARE = 0.75  # a dart fell out when (nearly) all its pixels show the empty board again
 AGREEMENT_WINDOW = 12  # darts seen by >= 3 cameras: does a camera agree with the others?
+# Something that lies flat on the board (a thin shadow or light streak, e.g. somebody walking past a lamp)
+# is at the same board position for every camera. A dart sticks out of the board: mapped onto the board
+# plane, each camera sees it somewhere else - only around the tip do the cameras agree.
+FLAT_CELL = 2.0  # mm, board plane grid for that comparison ...
+FLAT_RADIUS = 240.0  # ... on the board and the surround ring around it ...
+FLAT_TOL = 6.0  # ... calibration differences between the cameras ...
+FLAT_COVER = 0.7  # ... a change is flat when another camera saw this share of it at the same board place ...
+FLAT_EXTENT = 25.0  # ... and the common part is long (a dart's is just its tip: <= 15 mm in the simulator) ...
+FLAT_COVER_LONG = 0.5  # ... or this share along a really long stretch (a dart: <= 20 mm with >= 50 %)
+FLAT_EXTENT_LONG = 45.0
+STREAK_GAP = 10.0  # mm: a short piece is part of a streak when another camera sees its line go on on both
+STREAK_REACH = 50.0  # sides (from STREAK_GAP to STREAK_REACH beyond its ends) - a dart's line ends at its tip
+STREAK_COVER = 0.7
+LONELY_REACH = 150.0  # a dart only one camera sees: is it the end of a streak another camera sees along its line?
+LONELY_COVER = 0.5
+LONELY_TURN = 12.0  # deg: the direction of a short piece is uncertain - try the line turned by up to this much
+TIP_WINDOW = 25  # px (processing image): a dart seen by one camera only must change something there in another one
+EVIDENCE_KEEP = 9  # bug reports: camera images of the last darts / bounce-outs (three turns) ...
+DISCARDED_KEEP = 6  # ... and of the last changes that were no dart (a missed dart ends up there)
 
 
 @dataclass
@@ -62,6 +81,108 @@ class Observation:
     length_px: float
     area: int
     weight: float
+
+
+_FLAT_N = int(2 * FLAT_RADIUS / FLAT_CELL) + 1
+_FLAT_KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * int(FLAT_TOL / FLAT_CELL) + 1,) * 2)
+
+
+def _footprint(cam: "CameraState", mask: np.ndarray) -> np.ndarray | None:
+    """Changed pixels of a camera mapped onto the board plane (grid of FLAT_CELL mm, on the board only).
+
+    Right for everything that lies on the board; for a dart (which sticks out) only its tip is right.
+    """
+    if cam.Hinv is None or mask is None:
+        return None
+    ys, xs = np.nonzero(mask)
+    if len(xs) == 0:
+        return None
+    if len(xs) > 8000:
+        step = len(xs) // 8000 + 1
+        xs, ys = xs[::step], ys[::step]
+    P = cam.Hinv @ np.vstack([xs, ys, np.ones(len(xs))])
+    ok = P[2] > 1e-9  # beyond the horizon of the board plane
+    bx, by = P[0, ok] / P[2, ok], P[1, ok] / P[2, ok]
+    on = bx * bx + by * by <= FLAT_RADIUS * FLAT_RADIUS
+    if not on.any():
+        return None
+    grid = np.zeros((_FLAT_N, _FLAT_N), np.uint8)
+    gx = np.clip(((bx[on] + FLAT_RADIUS) / FLAT_CELL).astype(np.int32), 0, _FLAT_N - 1)
+    gy = np.clip(((by[on] + FLAT_RADIUS) / FLAT_CELL).astype(np.int32), 0, _FLAT_N - 1)
+    grid[gy, gx] = 1
+    return grid
+
+
+def _flat(mine: np.ndarray | None, other: np.ndarray | None) -> bool:
+    """Did the other camera see (nearly) all of this change at the same place on the board, along a long
+    stretch? Then it lies on the board - a dart would be somewhere else for the other camera."""
+    if mine is None or other is None:
+        return False
+    total = int(mine.sum())
+    if total == 0:
+        return False
+    common = mine & cv2.dilate(other, _FLAT_KERNEL)
+    share = int(common.sum()) / total
+    if share < FLAT_COVER_LONG:
+        return False
+    ys, xs = np.nonzero(common)
+    length = math.hypot(float(np.ptp(xs)), float(np.ptp(ys))) * FLAT_CELL
+    return length >= (FLAT_EXTENT if share >= FLAT_COVER else FLAT_EXTENT_LONG)
+
+
+def _continues(
+    o: "Observation",
+    mine: np.ndarray | None,
+    other: np.ndarray | None,
+    reach: float = STREAK_REACH,
+    both: bool = True,
+    cover: float = STREAK_COVER,
+    turn: float = 0.0,
+) -> bool:
+    """Does the other camera see this camera's line go on beyond both ends of what this camera saw (both=False:
+    beyond one end)? Then it is a piece of a streak lying on the board. A dart's line ends at its tip on one
+    side and at the flight on the other one (another camera sees the dart in its own direction, not along
+    this line)."""
+    if mine is None or other is None:
+        return False
+    ys, xs = np.nonzero(mine)
+    if len(xs) == 0:
+        return False
+    cells = np.column_stack([xs, ys]) * FLAT_CELL - FLAT_RADIUS + FLAT_CELL / 2
+    centre = cells.mean(axis=0)
+    near = cv2.dilate(other, _FLAT_KERNEL)
+    base = math.atan2(o.normal[0], -o.normal[1])
+    for a in np.radians(np.arange(-turn, turn + 0.1, 3.0)) if turn else [0.0]:
+        u = np.array([math.cos(base + a), math.sin(base + a)])
+        t = (cells - centre) @ u
+        sides = []
+        for side in (np.arange(t.min() - STREAK_GAP, t.min() - reach, -FLAT_CELL), np.arange(t.max() + STREAK_GAP, t.max() + reach, FLAT_CELL)):
+            pts = centre + side[:, None] * u
+            pts = pts[(pts**2).sum(axis=1) <= (FLAT_RADIUS - FLAT_CELL) ** 2]
+            if len(pts) < 8:
+                sides.append(False)  # nobody can tell
+                continue
+            g = ((pts + FLAT_RADIUS) / FLAT_CELL).astype(np.int32)
+            sides.append(float(near[g[:, 1], g[:, 0]].mean()) >= cover)
+        if all(sides) if both else any(sides):
+            return True
+    return False
+
+
+def _obs_info(obs: list[Observation]) -> list[dict]:
+    """What every camera saw (for bug reports): tip on the board (mm), line, size."""
+    return [
+        {
+            "camera": o.camera,
+            "tip": [round(float(o.tip_board[0]), 1), round(float(o.tip_board[1]), 1)],
+            "normal": [round(float(o.normal[0]), 4), round(float(o.normal[1]), 4)],
+            "offset": round(float(o.offset), 2),
+            "lengthPx": round(float(o.length_px), 1),
+            "area": int(o.area),
+            "weight": round(float(o.weight), 3),
+        }
+        for o in obs
+    ]
 
 
 def _homography(points: list[tuple[float, float]], w: int, h: int) -> np.ndarray | None:
@@ -236,12 +357,14 @@ class Detector:
         # darts of the current turn: id + per camera the pixels where it covers the empty board (fall-out check)
         self.turn_darts: list[dict] = []
         self._blobs: dict[int, np.ndarray] = {}
+        self._prints: dict[int, np.ndarray | None] = {}  # board plane footprints of all changes per camera (flat test)
         # the motion before the current evaluation (bounce-out check)
         self._motion_start = 0.0
         self._motion_last = 0.0
         self._motion_peak: dict[int, int] = {}
         self._motion_hand = False
         self._motion_darts: set[int] = set()  # cameras that saw a dart shaped object during the motion
+        self._motion_flat = False  # ... or something flat on the board (shadow / light streak): no bounce-out
         self._quiet_until = 0.0
         # per camera: was its line part of the consensus of darts that >= 3 cameras saw
         self.agreement: dict[int, deque] = {}
@@ -249,6 +372,11 @@ class Detector:
         self._means: dict[int, np.ndarray] = {}
         self._light_until = 0.0
         self.dark = False
+        self.last_lighting = 0.0  # wall clock of the last frame treated as a light change
+        # bug reports: the full resolution grey images of the last detections (references only, no copies)
+        self.evidence: deque = deque(maxlen=EVIDENCE_KEEP)
+        self.discarded: deque = deque(maxlen=DISCARDED_KEEP)
+        self._motion_frames: dict[int, np.ndarray] = {}  # per camera: frame at the peak of the current motion
 
     # ------------------------------------------------------------------ control
     def set_calibration(self, index: int, points: list[tuple[float, float]] | None) -> None:
@@ -278,6 +406,7 @@ class Detector:
             self._motion_peak = {}
             self._motion_hand = False
             self._motion_darts = set()
+            self._motion_flat = False
 
     def set_detecting(self, on: bool) -> None:
         with self._lock:
@@ -340,6 +469,7 @@ class Detector:
         if self._lighting(grays):
             # light switched on/off or the cameras are still adjusting their exposure: no hand, no dart –
             # just follow the image. The calibration is not affected, the board did not move.
+            self.last_lighting = time.time()
             for idx, g in grays.items():
                 cam = self.cams[idx]
                 cam.ref = cam.prev = g
@@ -370,8 +500,12 @@ class Detector:
             now = time.monotonic()
             if not self.moving:
                 self._motion_start, self._motion_peak, self._motion_hand, self._motion_darts = now, {}, False, set()
+                self._motion_frames = {}
+                self._motion_flat = False
             self._motion_last = now
             for idx, m in frame_diff.items():
+                if m > self._motion_peak.get(idx, -1):
+                    self._motion_frames[idx] = fulls[idx]
                 self._motion_peak[idx] = max(self._motion_peak.get(idx, 0), m)
             self.moving = True
             self.calm = 0
@@ -387,7 +521,7 @@ class Detector:
                     self._motion_hand = True
                     self._enter_takeout(events)
                 elif self._watch_bounce() and len(self._motion_darts) < 2:
-                    self._motion_darts |= self._dart_views(grays, {i: m for i, m in masks.items() if i not in self._motion_darts})
+                    self._motion_darts |= self._dart_views(grays, masks, skip=self._motion_darts)
             else:
                 self._motion_hand = True
             return events
@@ -472,6 +606,7 @@ class Detector:
         shadows = {i: cv2.bitwise_and(m, cv2.bitwise_not(masks[i])) for i, m in raw.items()}
         areas = {i: cv2.countNonZero(m) for i, m in masks.items()}
         self.last_areas = areas
+        raw_areas = {i: cv2.countNonZero(m) for i, m in raw.items()}
 
         if self._is_hand(areas):
             self._motion_hand = True
@@ -510,11 +645,16 @@ class Detector:
 
         if max(areas.values()) < s.minDartArea:
             if not gone and max(areas.values()) < s.minDartArea // 2 and self._bounced_out():
-                self._add_bounce_out(events)
+                self._add_bounce_out(events, fulls, areas, raw_areas)
+            elif max(raw_areas.values()) >= s.minDartArea // 2:
+                # something changed, but too little (or only light / shadow): a missed dart ends up here
+                small = max(areas.values()) >= s.minDartArea // 4
+                self._keep("discarded", fulls, {"reason": "too_small" if small else "shadow", "areas": areas, "rawAreas": raw_areas})
             self._set_refs(grays, fulls)  # noise / slow light change
             return
 
         if self.state == "takeout":
+            self._keep("discarded", fulls, {"reason": "fourth_dart", "areas": areas, "rawAreas": raw_areas})
             self._set_refs(grays, fulls)  # more than three darts: ignore
             return
 
@@ -531,10 +671,27 @@ class Detector:
             obs = self._analyze(idx, mask, fulls.get(idx), grays.get(idx))
             if obs is not None:
                 observations.append(obs)
+        # a thin shadow / light streak looks like a dart in every single camera - but it lies on the board
+        flat = self._flat_observations(observations, grays)
+        observations = [o for o in observations if o.camera not in flat]
         result = fuse(observations)
+        lonely = None
+        if result is not None and len(result[2]) == 1:
+            only = result[2][0]
+            if self._streak_end(next(o for o in observations if o.camera == only), grays):
+                flat.add(only)  # the end of a streak (the others see it go on along this line)
+                result = None
+            elif not self._seen_elsewhere(only, result[0], result[1], grays, shadows):
+                lonely, result = only, None  # one camera only, and the others see nothing where that dart would be
         if result is None:
+            reason = "flat" if flat else "single_camera" if lonely is not None else "no_dart_found"
+            self._keep(
+                "discarded",
+                fulls,
+                {"reason": reason, "areas": areas, "rawAreas": raw_areas, "observations": _obs_info(observations), "flat": sorted(flat), "lonely": lonely},
+            )
             self._set_refs(grays, fulls)
-            log.info("change detected but no dart found (areas %s)", areas)
+            log.info("change detected but no dart found (%s, areas %s)", reason, areas)
             return
         x, y, cams, confidence = result
         if len(observations) >= 3:
@@ -548,6 +705,21 @@ class Detector:
             tips[idx] = {"x": float(p[0] / cam.full_size[0]), "y": float(p[1] / cam.full_size[1])}
         dart_id = uuid.uuid4().hex
         self._remember(dart_id, grays)
+        self._keep(
+            "dart",
+            fulls,
+            {
+                "x": round(float(x), 2),
+                "y": round(float(y), 2),
+                "seg": {"number": number, "multiplier": multiplier},
+                "confidence": round(float(confidence), 2),
+                "cameras": sorted(cams),
+                "areas": areas,
+                "rawAreas": raw_areas,
+                "observations": _obs_info(observations),
+            },
+            dart_id,
+        )
         self._set_refs(grays, fulls)
         self.darts += 1
         if self.darts >= 3:
@@ -644,12 +816,93 @@ class Detector:
     def _watch_bounce(self) -> bool:
         return bool(getattr(self.settings, "bounceOut", 1)) and self.state == "throw" and self.darts < 3 and not self._motion_hand
 
-    def _dart_views(self, grays: dict[int, np.ndarray], masks: dict[int, np.ndarray]) -> set[int]:
-        """Cameras that see a dart shaped object (long and thin, not a shadow) in front of the board."""
+    def _weak_mask(self, idx: int, g: np.ndarray) -> np.ndarray | None:
+        """Every change of a camera, weak ones included (a streak can be just below the threshold in one
+        camera and just above it in another), shadows included, without single pixels."""
+        cam = self.cams[idx]
+        if cam.ref is None or cam.ref.shape != g.shape:
+            return None
+        mask = (cv2.absdiff(g, cam.ref) > self.settings.diffThreshold * LOW_THRESHOLD).astype(np.uint8) * 255
+        mask = cv2.bitwise_and(mask, cam.roi)
+        k = np.ones((2, 2), np.uint8)
+        return cv2.dilate(cv2.erode(mask, k, anchor=(0, 0)), k, anchor=(1, 1))
+
+    def _flat_observations(self, observations: list[Observation], grays: dict[int, np.ndarray]) -> set[int]:
+        """Cameras whose dart lies flat on the board: another camera saw the same change (weak ones and
+        shadows included) at the same board place."""
+        others = {i for i, c in self.cams.items() if not c.mirrored and i in grays}
+        prints: dict[int, np.ndarray | None] = {}
+        self._prints = prints  # for _streak_end
+        if len(others) < 2:
+            return set()
+        flat: set[int] = set()
+        for o in observations:
+            blob = self._blobs.get(o.camera)
+            mine = _footprint(self.cams[o.camera], blob) if blob is not None else None
+            for j in sorted(others - {o.camera}):
+                if j not in prints:
+                    prints[j] = _footprint(self.cams[j], self._weak_mask(j, grays[j]))
+                if _flat(mine, prints[j]) or _continues(o, mine, prints[j]):
+                    flat.add(o.camera)
+                    log.info("camera %d: change lies flat on the board (camera %d sees it at the same place) - no dart", o.camera + 1, j + 1)
+                    break
+        return flat
+
+    def _streak_end(self, o: Observation, grays: dict[int, np.ndarray]) -> bool:
+        """A dart only one camera sees: does another camera see its line go on far beyond one of its ends?"""
+        blob = self._blobs.get(o.camera)
+        mine = _footprint(self.cams[o.camera], blob) if blob is not None else None
+        for j, cam in self.cams.items():
+            if j == o.camera or cam.mirrored or j not in grays:
+                continue
+            if j not in self._prints:
+                self._prints[j] = _footprint(cam, self._weak_mask(j, grays[j]))
+            if _continues(o, mine, self._prints[j], reach=LONELY_REACH, both=False, cover=LONELY_COVER, turn=LONELY_TURN):
+                log.info("camera %d: the only view of this dart is the end of a streak camera %d sees - no dart", o.camera + 1, j + 1)
+                return True
+        return False
+
+    def _seen_elsewhere(self, idx: int, x: float, y: float, grays: dict[int, np.ndarray], shadows: dict[int, np.ndarray]) -> bool:
+        """Does another camera see a change where this dart would be - at its tip and the part of the dart
+        in front of it? Weak changes count (a black dart on a black field), shadow / light does not.
+        True when no other camera can tell (none sees that spot)."""
+        looked = False
+        weak = self.settings.diffThreshold * LOW_THRESHOLD
+        edge = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * SHADOW_EDGE + 1, 2 * SHADOW_EDGE + 1))
+        for j, cam in self.cams.items():
+            g = grays.get(j)
+            if j == idx or cam.mirrored or g is None or cam.ref is None or cam.ref.shape != g.shape or cam.H is None:
+                continue
+            tip = apply_h(cam.H, [[x, y]])[0]
+            h, w = g.shape
+            if not (0 <= tip[0] < w and 0 <= tip[1] < h):
+                continue
+            looked = True
+            n = cam.normal_direction(tip)
+            end = tip + (n * TIP_WINDOW if n is not None else 0)
+            sel = np.zeros((h, w), np.uint8)
+            cv2.line(sel, (int(round(tip[0])), int(round(tip[1]))), (int(round(end[0])), int(round(end[1]))), 1, 9)
+            changed = (cv2.absdiff(g, cam.ref) > weak) & (sel > 0)
+            light = shadows.get(j)
+            if light is not None and light.shape == changed.shape:
+                changed &= cv2.dilate(light, edge) == 0  # what the shadow filter took for light (and its soft edge)
+            if int(changed.sum()) >= 6:
+                return True
+        return not looked
+
+    def _dart_views(self, grays: dict[int, np.ndarray], masks: dict[int, np.ndarray], skip: set[int] | None = None) -> set[int]:
+        """Cameras that see a dart shaped object (long and thin, not a shadow) in front of the board.
+
+        masks: the changes of every camera (the other cameras tell whether something lies flat on the
+        board); skip: cameras that do not need to be looked at again.
+        """
         s = self.settings
         lo = BOUNCE_AREA * s.minDartArea
         seen: set[int] = set()
+        prints: dict[int, np.ndarray | None] = {}
         for idx, mask in masks.items():
+            if skip and idx in skip:
+                continue
             cam = self.cams[idx]
             if cam.mirrored or cam.ref is None:
                 continue
@@ -681,6 +934,15 @@ class Detector:
                     whole.append(cv2.countNonZero(_without_light(grays[idx], cam.ref, mask, strict=False)) == 0)
                 if whole[0]:
                     break
+                # a thin shadow / light streak: the other cameras see it at the same board place
+                piece = _footprint(cam, labels == i)
+                others = [j for j in masks if j != idx and not self.cams[j].mirrored]
+                for j in others:
+                    if j not in prints:
+                        prints[j] = _footprint(self.cams[j], self._weak_mask(j, grays[j]))
+                if any(_flat(piece, prints[j]) for j in others):
+                    self._motion_flat = True
+                    break
                 seen.add(idx)
                 break
         return seen
@@ -694,7 +956,7 @@ class Detector:
         s = self.settings
         if not getattr(s, "bounceOut", 1) or self.state != "throw" or self.darts >= 3:
             return False
-        if self._motion_hand or self._motion_start < self._quiet_until or self._motion_last - self._motion_start > BOUNCE_MAX_S:
+        if self._motion_hand or self._motion_flat or self._motion_start < self._quiet_until or self._motion_last - self._motion_start > BOUNCE_MAX_S:
             return False
         lo = BOUNCE_AREA * s.minDartArea
         seen = [p for p in self._motion_peak.values() if p >= lo]
@@ -703,16 +965,42 @@ class Detector:
         need = min(2, sum(1 for c in self.cams.values() if not c.mirrored))
         return need > 0 and len(seen) >= need and len(self._motion_darts) >= need
 
-    def _add_bounce_out(self, events: list[tuple]) -> None:
+    def _add_bounce_out(self, events: list[tuple], fulls: dict[int, np.ndarray] | None = None, areas=None, raw_areas=None) -> None:
         log.info("bounce-out: dart hit the board and dropped (peaks %s, dart seen by cameras %s)", self._motion_peak, sorted(self._motion_darts))
+        dart_id = uuid.uuid4().hex
+        self._keep("bounce", fulls or {}, {"areas": areas, "rawAreas": raw_areas, "dartSeenBy": sorted(self._motion_darts)}, dart_id)
         self.darts += 1
         if self.darts >= 3:
             self.state = "takeout"
             events.append(("state",))
         events.append(
-            ("dart", {"id": uuid.uuid4().hex, "seg": {"number": 0, "multiplier": 0}, "confidence": 0.5, "cameras": [], "out": "bounce"})
+            ("dart", {"id": dart_id, "seg": {"number": 0, "multiplier": 0}, "confidence": 0.5, "cameras": [], "out": "bounce"})
         )
         events.append(("state",))
+
+    def _keep(self, kind: str, fulls: dict[int, np.ndarray], info: dict, ident: str | None = None) -> None:
+        """Remember the camera images of a detection for bug reports (before the references move on).
+
+        before = what the detector compared against, after = the calm image it evaluated, peak = the
+        image with the most motion in between (the dart in flight, a hand, a shadow).
+        """
+        (self.discarded if kind == "discarded" else self.evidence).append(
+            {
+                "id": ident or uuid.uuid4().hex,
+                "kind": kind,
+                "at": time.time(),
+                "state": self.state,
+                "darts": self.darts,
+                "before": {i: c.ref_full for i, c in self.cams.items() if c.ref_full is not None},
+                "after": dict(fulls),
+                "peak": dict(self._motion_frames),
+                "info": {
+                    **info,
+                    "motionPeak": dict(self._motion_peak),
+                    "motionSeconds": round(self._motion_last - self._motion_start, 2),
+                },
+            }
+        )
 
     def _analyze(self, idx: int, mask: np.ndarray, full: np.ndarray | None = None, gray: np.ndarray | None = None) -> Observation | None:
         cam = self.cams[idx]

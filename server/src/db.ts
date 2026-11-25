@@ -102,6 +102,31 @@ const MIGRATIONS: string[] = [
   ALTER TABLE matches ADD COLUMN voice_mode TEXT NOT NULL DEFAULT 'host';
   CREATE INDEX matches_running_idx ON matches(owner_id) WHERE status = 'running';
   `,
+  `
+  -- bug reports: a wrongly detected dart with the camera images of the board (for the analysis)
+  CREATE TABLE bug_reports (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID REFERENCES users(id) ON DELETE SET NULL,
+    board_id TEXT REFERENCES boards(id) ON DELETE SET NULL,
+    match_id UUID REFERENCES matches(id) ON DELETE SET NULL,
+    kind TEXT NOT NULL,
+    detected JSONB,
+    actual JSONB,
+    note TEXT NOT NULL DEFAULT '',
+    details JSONB NOT NULL DEFAULT '{}',
+    board_error TEXT,
+    status TEXT NOT NULL DEFAULT 'open',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  );
+  CREATE INDEX bug_reports_created_idx ON bug_reports(created_at DESC);
+  CREATE TABLE bug_report_files (
+    report_id UUID NOT NULL REFERENCES bug_reports(id) ON DELETE CASCADE,
+    name TEXT NOT NULL,
+    mime TEXT NOT NULL,
+    data BYTEA NOT NULL,
+    PRIMARY KEY (report_id, name)
+  );
+  `,
 ];
 
 async function waitForDb(): Promise<void> {

@@ -34,6 +34,10 @@ export default function TabsLayout() {
         options={{ title: 'Statistik', tabBarIcon: ({ color, size }) => <Ionicons name="stats-chart" color={color as string} size={size} /> }}
       />
       <Tabs.Screen
+        name="leaderboard"
+        options={{ title: 'Rangliste', tabBarIcon: ({ color, size }) => <Ionicons name="trophy" color={color as string} size={size} /> }}
+      />
+      <Tabs.Screen
         name="profile"
         options={{ title: 'Profil', tabBarIcon: ({ color, size }) => <Ionicons name="person-circle" color={color as string} size={size} /> }}
       />

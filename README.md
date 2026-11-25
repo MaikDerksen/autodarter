@@ -54,7 +54,7 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Bewegt sich eine Hand am Board, ohne Darts zu ziehen, bleibt der Zustand erhalten.
   - **Abpraller und rausgefallene Darts** (offizielle Regel: zählt als geworfen, aber ohne Punkte):
     - Fällt ein Dart vor dem Ziehen aus dem Board – auch während der nächste einschlägt –, wird er nachträglich zu **Miss** („rausgefallen“), seine Markierung bleibt grau stehen.
-    - Trifft ein Dart das Board und fällt sofort herunter, meldet das Board einen **Miss** („Abpraller“). Schatten zählen dafür seit 0.4.2 nicht mehr. Das lässt sich unter *Erkennungs-Einstellungen → Abpraller als Miss* abschalten, falls Bewegungen direkt vor dem Board fälschlich als Abpraller gezählt werden. Ein Dart, der das Board ganz verfehlt, ist für die Kameras oft unsichtbar – den bitte als Miss eintippen.
+    - Trifft ein Dart das Board und fällt sofort herunter, meldet das Board einen **Miss** („Abpraller“). Schatten zählen dafür seit 0.4.2 nicht mehr, dünne Schatten- und Lichtstreifen seit 0.4.3. Das lässt sich unter *Erkennungs-Einstellungen → Abpraller als Miss* abschalten, falls Bewegungen direkt vor dem Board fälschlich als Abpraller gezählt werden. Ein Dart, der das Board ganz verfehlt, ist für die Kameras oft unsichtbar – den bitte als Miss eintippen.
 - **Spielmodi**:
   - **X01** (301/501): Straight-, Double- oder Master-In und -Out, Bust-Regel, Legs („First to N“), Checkout-Vorschläge
   - **Cricket**: Standard oder Cut-Throat, Rundenlimit
@@ -76,7 +76,20 @@ Selbst gehostete, quelloffene Alternative zu Autodarts: automatische Dart-Erkenn
   - Cricket: MPR-Verlauf, Marks pro Aufnahme und pro Zahl
   - Around the Clock: Darts pro Spiel, Trefferquote
   - Trefferbild auf dem Board, Head-to-Head gegen Freunde, Siegquote, letzte Spiele
+- **Rangliste** aller Spieler mit Konto, je eine für X01, Cricket und Around the Clock und als „Champion of Champions“ über alle Spielarten:
+  - Wertung per Glicko (Elo mit Unsicherheit): Gegen starke Gegner bringt ein Sieg mehr als gegen schwache, neue Spieler bewegen sich anfangs schneller.
+  - Jedes Match zählt halb für den Sieg und halb für den Anteil der Legs – ein 3:0 bringt mehr als ein 3:2.
+  - Nur komplett gespielte Matches gegen andere Spieler mit Konto zählen; abgebrochene Spiele, Solo-Training und Spiele gegen Gäste ändern die Wertung nicht.
+  - Einen Platz gibt es ab 5 gewerteten Matches, vorher steht man unter „Vorläufig“ – ein einziger Sieg mit 100 % Siegquote macht also noch keinen Platz 1.
+  - Daneben zur Info: Ø 3-Dart-Average, MPR bzw. Trefferquote über alle fertigen Spiele (auch Training).
 - **Board-Verwaltung**: Start, Stopp, Reset, Kameras neu suchen, Erkennungsparameter einstellen, Erkennungstest ohne laufendes Spiel
+- **Fehler melden** (Käfer-Knopf im Spiel neben „Weiter“, auf dem Handy oben in der Leiste):
+  - Dart der letzten beiden Aufnahmen antippen (oder „Nicht erkannt“) und sagen, was es wirklich war, auch „Kein Dart geworfen“.
+  - Auf Wunsch wird der Wurf gleich im Spiel korrigiert, nachgetragen oder entfernt.
+  - Das Board schickt die Kamerabilder dieses Wurfs mit, verlustfrei, damit die Erkennung später genau nachgestellt werden kann. Pro Kamera kommen drei Bilder: vorher, während der Bewegung und nachher. Dazu gehören das Live-Bild und die Daten der Erkennung.
+  - Bei „Nicht erkannt“ kommen zusätzlich die letzten Änderungen mit, die das Board nicht als Dart gewertet hat.
+  - Das Board hält die Bilder der letzten 9 Darts bereit, also möglichst bald melden.
+  - Ansehen können die Berichte nur Admins (`ADMIN_USERS`, sonst das zuerst angelegte Konto), unter Profil → Fehlerberichte. Dort gibt es auch den Download als ZIP.
 
 Eine ausführliche Analyse von Autodarts und was davon (noch nicht) umgesetzt ist, steht in [`docs/AUTODARTS-FEATURES.md`](docs/AUTODARTS-FEATURES.md).
 
@@ -283,10 +296,12 @@ Unter **Spielen** 301 / 501 / Cricket / Around the Clock wählen, Spieler hinzuf
 3. Die Fragmente des neuen Darts (Spitze, Barrel, Flight) werden gesammelt. Schwächere Änderungen, die an klare Dart-Pixel anschließen, gehören mit dazu – so bleibt ein schwarzer Dart vor einem schwarzen Feld oder einem roten Ring in mehreren Kameras sichtbar. Dabei hilft die Richtung der Board-Normalen im Bild, die aus der Kalibrierung berechnet wird (Kamerapose per Homographie-Zerlegung).
 4. Die **Dart-Achse** wird auf dem schmalen Teil (Spitze und Barrel) gefittet, der breite Flight wird ausgeschlossen.
 5. Über die Kalibrier-Homographie wird diese Achse auf die Board-Ebene abgebildet. Die Spitze liegt **garantiert auf dieser Linie**, auch wenn die dünne Stahlspitze im Bild nicht zu sehen ist.
-6. Die Linien aller Kameras werden robust geschnitten: das beste konsistente Kamerapaar, danach Ausgleichsrechnung über alle passenden Kameras. Daraus ergeben sich Position (mm) und Segment.
-7. Takeout: Eine große Änderung bedeutet „Hand am Board“. Wird das Bild danach wieder ruhig und hat sich etwas verändert, ist der Takeout beendet. Hat sich nichts verändert, bleibt der alte Zustand erhalten.
-8. Rausgefallen: Zeigen die Pixel eines Darts dieser Aufnahme wieder das leere Board, ist er herausgefallen. Diese Stelle zählt auch nicht als neuer Dart.
-9. Abpraller: Eine kurze Bewegung, in der mindestens zwei Kameras einen dart-förmigen Gegenstand (lang und dünn, kein Schatten) vor dem Board sehen und die nichts im Board hinterlässt (nicht in den ersten 5 Sekunden nach dem Ziehen).
+6. **Flach auf dem Board = kein Dart.** Ein dünner Schatten- oder Lichtstreifen sieht in jeder einzelnen Kamera aus wie ein Dart, z. B. wenn jemand an einer Lampe vorbeigeht. Auf die Board-Ebene zurückgerechnet liegt der Streifen aber für alle Kameras an derselben Stelle. Ein Dart steht aus dem Board heraus und landet für jede Kamera woanders, nur die Spitze stimmt überein. Sieht eine andere Kamera dieselbe Änderung über eine lange Strecke an derselben Board-Stelle, ist es kein Dart.
+   - Ein Dart, den nur eine Kamera sieht, zählt nur, wenn eine zweite Kamera an seiner Spitze ebenfalls etwas sieht, das kein Schatten und kein Licht ist.
+7. Die Linien aller Kameras werden robust geschnitten: das beste konsistente Kamerapaar, danach Ausgleichsrechnung über alle passenden Kameras. Daraus ergeben sich Position (mm) und Segment.
+8. Takeout: Eine große Änderung bedeutet „Hand am Board“. Wird das Bild danach wieder ruhig und hat sich etwas verändert, ist der Takeout beendet. Hat sich nichts verändert, bleibt der alte Zustand erhalten.
+9. Rausgefallen: Zeigen die Pixel eines Darts dieser Aufnahme wieder das leere Board, ist er herausgefallen. Diese Stelle zählt auch nicht als neuer Dart.
+10. Abpraller: Eine kurze Bewegung, in der mindestens zwei Kameras einen dart-förmigen Gegenstand (lang und dünn, kein Schatten, nicht flach auf dem Board) vor dem Board sehen und die nichts im Board hinterlässt (nicht in den ersten 5 Sekunden nach dem Ziehen).
 
 Ergebnis im Simulator mit 240 Würfen auf 3 Kameras (die Hälfte mit absichtlich 2 px Kalibrierfehler):
 
@@ -334,7 +349,7 @@ Die App ist eine Codebasis für **Website, iOS, Android, Tablet und PC**:
 | `POSTGRES_PASSWORD`, `PORT` | Server | DB-Passwort und Port der Web-App |
 | `BOARD_IDLE_MINUTES` | Server | Nach so vielen Minuten ohne Wurf darf ein anderer das Board übernehmen (Standard 30) |
 | `STALE_MATCH_HOURS` | Server | Laufende Spiele ohne Wurf seit so vielen Stunden werden automatisch beendet (Standard 12) |
-| `ADMIN_USERS` | Server | Benutzernamen, die den Server aus der App aktualisieren dürfen (Komma-getrennt). Leer = das zuerst angelegte Konto |
+| `ADMIN_USERS` | Server | Benutzernamen, die den Server aus der App aktualisieren und die Fehlerberichte sehen dürfen (Komma-getrennt). Leer = das zuerst angelegte Konto. Nur Konten eintragen, die schon existieren: ist z. B. `admin` noch frei, könnte sich sonst jemand so registrieren. |
 | `AUTODARTER_SERVER` | Pi | z. B. `http://192.168.1.10:3000` |
 | `CAMERA_SOURCE` | Pi | `v4l2` (echte Kameras) oder `sim` |
 | `CAMERAS` | Pi | Optional: feste Geräte, z. B. `/dev/video0,/dev/video2,/dev/video4` |
@@ -343,6 +358,22 @@ Die App ist eine Codebasis für **Website, iOS, Android, Tablet und PC**:
 | `UPDATE_INTERVAL`, `UPDATE_HOURS`, `TZ` | beide | Auto-Update: Prüfintervall in Sekunden, optionales Zeitfenster wie `3-6` |
 
 Der Pi speichert seine Board-ID, das Board-Secret, die Kalibrierung (pro USB-Port) und die Einstellungen in `board/data/`.
+
+### Fehlerberichte auf dem Server exportieren
+
+Die Berichte liegen samt Bildern in der Datenbank. Es braucht kein zusätzliches Volume, und sie stecken im normalen DB-Backup mit drin. Per SSH auf dem Server, im Ordner mit der `docker-compose.yml`:
+
+```bash
+docker compose exec -T server node dist/export-reports.js --list                    # Übersicht
+docker compose exec -T server node dist/export-reports.js > berichte.zip            # alle offenen als ZIP
+docker compose exec -T server node dist/export-reports.js --all --since 2026-11-01 > berichte.zip
+docker compose exec -T server node dist/export-reports.js --done <id> <id>          # als erledigt markieren
+```
+
+Im ZIP liegt pro Bericht ein Ordner mit `report.json` und den Bildern:
+- `report.json` enthält Spiel, Aufnahme, Kalibrierung, Einstellungen und die Erkennungsdaten pro Kamera.
+- `*-before/peak/after.png` sind die Graubilder in voller Auflösung, so wie die Erkennung sie gesehen hat.
+- `now-cam*-live.jpg` ist das Farbbild beim Melden.
 
 ## Grenzen und nächste Schritte
 

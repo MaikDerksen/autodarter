@@ -50,7 +50,10 @@ interface LiveBoard {
   pending: Map<string, (msg: BoardReply) => void>;
 }
 
-type BoardReply = Extract<BoardToServer, { type: 'snapshot' } | { type: 'auto_calibration' }>;
+type BoardReply = Extract<
+  BoardToServer,
+  { type: 'snapshot' } | { type: 'auto_calibration' } | { type: 'report_file' } | { type: 'report_done' }
+>;
 
 const live = new Map<string, LiveBoard>();
 
@@ -199,6 +202,70 @@ function boardRequest<T extends BoardReply>(id: string, build: (requestId: strin
       resolve(msg as T);
     });
     sendToBoard(id, build(requestId));
+  });
+}
+
+/** Images and detector data of a bug report, as delivered by the board. */
+export interface BoardReport {
+  files: { name: string; mime: string; data: Buffer }[];
+  info: Record<string, unknown> | null;
+  /** the board did not deliver everything (offline, error, too slow) */
+  error: string | null;
+}
+
+const REPORT_FILE_NAME = /^[a-z0-9][a-z0-9_.-]{0,79}$/i;
+const REPORT_MIME = new Set(['image/png', 'image/jpeg']);
+const REPORT_MAX_FILES = 60;
+const REPORT_MAX_BYTES = 60 * 1024 * 1024;
+
+/**
+ * Ask the board for the camera images of the given detections (one message per image, then
+ * report_done). Never rejects: whatever arrived is returned, with the reason when it is incomplete.
+ */
+export function requestBoardReport(id: string, darts: string[], discarded: number): Promise<BoardReport> {
+  const out: BoardReport = { files: [], info: null, error: null };
+  const l = live.get(id);
+  if (!l) return Promise.resolve({ ...out, error: 'Board ist offline' });
+  const requestId = randomUUID();
+  let bytes = 0;
+  return new Promise((resolve) => {
+    let idle: NodeJS.Timeout;
+    const finish = (error: string | null) => {
+      clearTimeout(idle);
+      clearTimeout(cap);
+      l.pending.delete(requestId);
+      out.error = error;
+      resolve(out);
+    };
+    // the images can take a while on a slow upload: give up when nothing arrives for 30 s
+    const wait = () => {
+      clearTimeout(idle);
+      idle = setTimeout(() => finish('Board hat nicht rechtzeitig geantwortet'), 30_000);
+    };
+    const cap = setTimeout(() => finish('Board hat nicht rechtzeitig alle Bilder geschickt'), 180_000);
+    wait();
+    l.pending.set(requestId, (msg) => {
+      if (msg.type === 'report_file') {
+        wait();
+        const data = typeof msg.data === 'string' ? Buffer.from(msg.data, 'base64') : Buffer.alloc(0);
+        const ok =
+          typeof msg.name === 'string' &&
+          REPORT_FILE_NAME.test(msg.name) &&
+          REPORT_MIME.has(msg.mime) &&
+          data.length > 0 &&
+          out.files.length < REPORT_MAX_FILES &&
+          bytes + data.length <= REPORT_MAX_BYTES &&
+          !out.files.some((f) => f.name === msg.name);
+        if (ok) {
+          out.files.push({ name: msg.name, mime: msg.mime, data });
+          bytes += data.length;
+        }
+      } else if (msg.type === 'report_done') {
+        out.info = msg.info && typeof msg.info === 'object' && !Array.isArray(msg.info) ? msg.info : null;
+        finish(typeof msg.error === 'string' ? `Board: ${msg.error.slice(0, 200)}` : null);
+      }
+    });
+    if (!sendToBoard(id, { type: 'report_request', requestId, darts, discarded })) finish('Board ist offline');
   });
 }
 
@@ -373,6 +440,8 @@ async function onBoardMessage(board: LiveBoard, msg: BoardToServer): Promise<voi
     }
     case 'snapshot':
     case 'auto_calibration':
+    case 'report_file':
+    case 'report_done':
       board.pending.get(msg.requestId)?.(msg);
       break;
     case 'pong':

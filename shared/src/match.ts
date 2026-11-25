@@ -73,6 +73,8 @@ export interface DartEvent {
   bid?: string;
   /** bounced out / fell out of the board: counts as thrown, scores nothing (seg is MISS) */
   out?: DartOut;
+  /** corrected by hand: what the board had detected (kept for bug reports) */
+  det?: { seg: Segment; x?: number; y?: number; out?: DartOut };
 }
 
 export interface NextEvent {
